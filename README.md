@@ -16,7 +16,8 @@ A high-performance Rust library for parsing and serializing the
 - **Zero-copy parsing** -- uses `bytes::Bytes` to slice into the input buffer without copying
 - **RESP2 and RESP3** -- full support for both protocol versions with separate frame types
 - **Streaming parser** -- handles partial reads and pipelining for incremental TCP data
-- **High performance** -- 4.8-8.0 GB/s throughput in benchmarks
+- **Serialization** -- convert frames back to wire format with `frame_to_bytes`
+- **High performance** -- up to 2-9x faster than `redis-protocol` (see [benchmarks](#benchmarks))
 - **Minimal dependencies** -- only `bytes` and `thiserror`
 - **No async runtime** -- pure sync parsing that works in any context
 
@@ -132,9 +133,54 @@ let (frame, _) = resp3::parse_frame(data).unwrap();
 Streaming variants (chunked strings, arrays, maps, sets, attributes, pushes)
 are also fully supported.
 
+## Examples
+
+### Parse demo
+
+A standalone demo of RESP2/RESP3 parsing, serialization, and the streaming parser:
+
+```sh
+cargo run --example parse
+```
+
+### Breadis
+
+A bread-themed Redis-compatible TCP server that speaks RESP2 -- demonstrates
+real-world usage with the streaming parser for incremental TCP reads.
+
+```sh
+cargo run --example breadis
+# In another terminal:
+redis-cli -p 6380
+
+127.0.0.1:6380> KNEAD sourdough 10
+Kneading sourdough... the gluten is developing!
+127.0.0.1:6380> PROOF sourdough
+Proofing sourdough... let it rise!
+127.0.0.1:6380> BAKE sourdough 450
+Baking sourdough at 450F... smells amazing!
+127.0.0.1:6380> MENU
+sourdough: baking at 450F
+```
+
 ## Benchmarks
 
-Run benchmarks with:
+Comparative benchmarks against [`redis-protocol`](https://crates.io/crates/redis-protocol) v6
+(run with `cargo bench --bench comparison`):
+
+| Benchmark | resp-rs | redis-protocol | Speedup |
+|-----------|---------|----------------|---------|
+| resp2/simple_string | 11.9 ns | 21.5 ns | **1.8x** |
+| resp2/bulk_string | 12.4 ns | 26.9 ns | **2.2x** |
+| resp2/array (SET cmd) | 42.7 ns | 125.8 ns | **2.9x** |
+| resp2/array (100 elems) | 0.81 us | 3.03 us | **3.7x** |
+| resp3/simple_string | 40.4 ns | 81.8 ns | **2.0x** |
+| resp3/bulk_string | 41.3 ns | 91.0 ns | **2.2x** |
+| resp3/array (SET cmd) | 82.9 ns | 389.8 ns | **4.7x** |
+| resp3/integer (i64 max) | 48.1 ns | 85.8 ns | **1.8x** |
+| resp3/array (100 elems) | 1.09 us | 9.38 us | **8.6x** |
+
+Run the full benchmark suite:
 
 ```sh
 cargo bench
