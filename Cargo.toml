@@ -15,6 +15,7 @@ thiserror = "2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 redis-protocol = { version = "6", features = ["resp2", "resp3", "bytes"] }
 
 [[bench]]

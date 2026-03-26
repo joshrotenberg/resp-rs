@@ -1,0 +1,222 @@
+use bytes::Bytes;
+use proptest::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Arbitrary frame generators
+// ---------------------------------------------------------------------------
+
+/// Generate a byte string that is safe for RESP simple strings / errors
+/// (no \r or \n characters).
+fn safe_line_bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(
+        prop::num::u8::ANY.prop_filter("no CR/LF", |b| *b != b'\r' && *b != b'\n'),
+        0..128,
+    )
+}
+
+/// Generate an arbitrary RESP2 frame (recursive for arrays).
+fn arb_resp2_frame() -> impl Strategy<Value = resp_rs::resp2::Frame> {
+    use resp_rs::resp2::Frame;
+
+    let leaf = prop_oneof![
+        safe_line_bytes().prop_map(|b| Frame::SimpleString(Bytes::from(b))),
+        safe_line_bytes().prop_map(|b| Frame::Error(Bytes::from(b))),
+        any::<i64>().prop_map(Frame::Integer),
+        prop::option::of(prop::collection::vec(any::<u8>(), 0..256))
+            .prop_map(|opt| Frame::BulkString(opt.map(Bytes::from))),
+    ];
+
+    leaf.prop_recursive(
+        3,  // max depth
+        64, // max nodes
+        8,  // items per collection
+        |inner| prop::option::of(prop::collection::vec(inner, 0..8)).prop_map(Frame::Array),
+    )
+}
+
+/// Generate an arbitrary RESP3 frame (recursive for arrays/maps/sets/etc).
+fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
+    use resp_rs::resp3::Frame;
+
+    let leaf = prop_oneof![
+        safe_line_bytes().prop_map(|b| Frame::SimpleString(Bytes::from(b))),
+        safe_line_bytes().prop_map(|b| Frame::Error(Bytes::from(b))),
+        any::<i64>().prop_map(Frame::Integer),
+        prop::option::of(prop::collection::vec(any::<u8>(), 0..256))
+            .prop_map(|opt| Frame::BulkString(opt.map(Bytes::from))),
+        Just(Frame::Null),
+        any::<bool>().prop_map(Frame::Boolean),
+        // Use finite f64 only (NaN breaks PartialEq, special floats have separate repr)
+        any::<f64>()
+            .prop_filter("finite", |f| f.is_finite())
+            .prop_map(Frame::Double),
+        safe_line_bytes().prop_map(|b| Frame::BigNumber(Bytes::from(b))),
+        prop::collection::vec(any::<u8>(), 0..256).prop_map(|b| Frame::BlobError(Bytes::from(b))),
+        // VerbatimString: 3-byte format tag + arbitrary content
+        (
+            prop::collection::vec(
+                prop::num::u8::ANY.prop_filter("no colon/cr/lf", |b| {
+                    *b != b':' && *b != b'\r' && *b != b'\n'
+                }),
+                3..=3,
+            ),
+            prop::collection::vec(any::<u8>(), 0..128),
+        )
+            .prop_map(|(fmt, content)| {
+                Frame::VerbatimString(Bytes::from(fmt), Bytes::from(content))
+            }),
+    ];
+
+    leaf.prop_recursive(
+        3,  // max depth
+        64, // max nodes
+        6,  // items per collection
+        |inner| {
+            prop_oneof![
+                // Array
+                prop::option::of(prop::collection::vec(inner.clone(), 0..6)).prop_map(Frame::Array),
+                // Set
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Frame::Set),
+                // Map
+                prop::collection::vec((inner.clone(), inner.clone()), 0..4).prop_map(Frame::Map),
+                // Attribute
+                prop::collection::vec((inner.clone(), inner.clone()), 0..4)
+                    .prop_map(Frame::Attribute),
+                // Push
+                prop::collection::vec(inner, 0..6).prop_map(Frame::Push),
+            ]
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// RESP2 property tests
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Roundtrip: for any valid RESP2 frame, serialize then parse should yield
+    /// the identical frame with no remaining bytes.
+    #[test]
+    fn resp2_roundtrip(frame in arb_resp2_frame()) {
+        let wire = resp_rs::resp2::frame_to_bytes(&frame);
+        let (parsed, rest) = resp_rs::resp2::parse_frame(wire).unwrap();
+        prop_assert_eq!(&parsed, &frame);
+        prop_assert!(rest.is_empty(), "leftover bytes: {:?}", rest);
+    }
+
+    /// Arbitrary bytes should never cause a panic -- only Ok or Err.
+    #[test]
+    fn resp2_no_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        let _ = resp_rs::resp2::parse_frame(Bytes::from(data));
+    }
+
+    /// If parse succeeds consuming some prefix, re-parsing that exact prefix
+    /// should produce the same result.
+    #[test]
+    fn resp2_deterministic(data in prop::collection::vec(any::<u8>(), 1..512)) {
+        let input = Bytes::from(data);
+        if let Ok((frame1, rest1)) = resp_rs::resp2::parse_frame(input.clone()) {
+            let consumed = input.len() - rest1.len();
+            let prefix = input.slice(..consumed);
+            let (frame2, rest2) = resp_rs::resp2::parse_frame(prefix).unwrap();
+            prop_assert_eq!(frame1, frame2);
+            prop_assert!(rest2.is_empty());
+        }
+    }
+
+    /// Concatenating serialized frames produces parseable pipelined data.
+    #[test]
+    fn resp2_pipeline(
+        frames in prop::collection::vec(arb_resp2_frame(), 1..8)
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp2::frame_to_bytes(f));
+        }
+        let mut input = Bytes::from(wire);
+        for expected in &frames {
+            let (parsed, rest) = resp_rs::resp2::parse_frame(input).unwrap();
+            prop_assert_eq!(&parsed, expected);
+            input = rest;
+        }
+        prop_assert!(input.is_empty());
+    }
+
+    /// The streaming parser should produce the same frames as direct parsing.
+    #[test]
+    fn resp2_streaming_matches_direct(frame in arb_resp2_frame()) {
+        let wire = resp_rs::resp2::frame_to_bytes(&frame);
+
+        let mut parser = resp_rs::resp2::Parser::new();
+        parser.feed(wire);
+        let parsed = parser.next_frame().unwrap().unwrap();
+        prop_assert_eq!(&parsed, &frame);
+        prop_assert!(parser.next_frame().unwrap().is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RESP3 property tests
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Roundtrip: for any valid RESP3 frame, serialize then parse should yield
+    /// the identical frame with no remaining bytes.
+    #[test]
+    fn resp3_roundtrip(frame in arb_resp3_frame()) {
+        let wire = resp_rs::resp3::frame_to_bytes(&frame);
+        let (parsed, rest) = resp_rs::resp3::parse_frame(wire).unwrap();
+        prop_assert_eq!(&parsed, &frame);
+        prop_assert!(rest.is_empty(), "leftover bytes: {:?}", rest);
+    }
+
+    /// Arbitrary bytes should never cause a panic -- only Ok or Err.
+    #[test]
+    fn resp3_no_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        let _ = resp_rs::resp3::parse_frame(Bytes::from(data));
+    }
+
+    /// If parse succeeds consuming some prefix, re-parsing that exact prefix
+    /// should produce the same result.
+    #[test]
+    fn resp3_deterministic(data in prop::collection::vec(any::<u8>(), 1..512)) {
+        let input = Bytes::from(data);
+        if let Ok((frame1, rest1)) = resp_rs::resp3::parse_frame(input.clone()) {
+            let consumed = input.len() - rest1.len();
+            let prefix = input.slice(..consumed);
+            let (frame2, rest2) = resp_rs::resp3::parse_frame(prefix).unwrap();
+            prop_assert_eq!(frame1, frame2);
+            prop_assert!(rest2.is_empty());
+        }
+    }
+
+    /// Concatenating serialized frames produces parseable pipelined data.
+    #[test]
+    fn resp3_pipeline(
+        frames in prop::collection::vec(arb_resp3_frame(), 1..8)
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp3::frame_to_bytes(f));
+        }
+        let mut input = Bytes::from(wire);
+        for expected in &frames {
+            let (parsed, rest) = resp_rs::resp3::parse_frame(input).unwrap();
+            prop_assert_eq!(&parsed, expected);
+            input = rest;
+        }
+        prop_assert!(input.is_empty());
+    }
+
+    /// The streaming parser should produce the same frames as direct parsing.
+    #[test]
+    fn resp3_streaming_matches_direct(frame in arb_resp3_frame()) {
+        let wire = resp_rs::resp3::frame_to_bytes(&frame);
+
+        let mut parser = resp_rs::resp3::Parser::new();
+        parser.feed(wire);
+        let parsed = parser.next_frame().unwrap().unwrap();
+        prop_assert_eq!(&parsed, &frame);
+        prop_assert!(parser.next_frame().unwrap().is_none());
+    }
+}
