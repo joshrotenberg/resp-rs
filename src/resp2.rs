@@ -46,67 +46,80 @@ pub enum Frame {
 /// assert_eq!(rest, Bytes::from("rest"));
 /// ```
 pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
-    if input.is_empty() {
+    let (frame, consumed) = parse_frame_inner(&input, 0)?;
+    Ok((frame, input.slice(consumed..)))
+}
+
+/// Offset-based internal parser. Works with byte positions to avoid creating
+/// intermediate `Bytes::slice()` objects. Only slices for actual frame data.
+fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
+    let buf = input.as_ref();
+    if pos >= buf.len() {
         return Err(ParseError::Incomplete);
     }
 
-    let tag = input[0];
-    let after_tag = input.slice(1..);
+    let tag = buf[pos];
 
     match tag {
         b'+' => {
-            let (line, rest) = split_line(&after_tag)?;
-            Ok((Frame::SimpleString(line), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            Ok((
+                Frame::SimpleString(input.slice(pos + 1..line_end)),
+                after_crlf,
+            ))
         }
         b'-' => {
-            let (line, rest) = split_line(&after_tag)?;
-            Ok((Frame::Error(line), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            Ok((Frame::Error(input.slice(pos + 1..line_end)), after_crlf))
         }
         b':' => {
-            let (line, rest) = split_line(&after_tag)?;
-            let s = std::str::from_utf8(&line).map_err(|_| ParseError::Utf8Error)?;
-            let v: i64 = s.parse().map_err(|_| ParseError::InvalidFormat)?;
-            Ok((Frame::Integer(v), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let v = parse_i64(&buf[pos + 1..line_end])?;
+            Ok((Frame::Integer(v), after_crlf))
         }
         b'$' => {
-            let (len_line, rest) = split_line(&after_tag)?;
-            let len_str = std::str::from_utf8(&len_line).map_err(|_| ParseError::Utf8Error)?;
-            if len_str == "-1" {
-                return Ok((Frame::BulkString(None), rest));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            // null bulk string: $-1\r\n
+            if len_bytes == b"-1" {
+                return Ok((Frame::BulkString(None), after_crlf));
             }
-            let len: usize = len_str.parse().map_err(|_| ParseError::BadLength)?;
+            let len = parse_usize(len_bytes)?;
             if len == 0 {
-                if rest.len() < 2 {
+                if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
                 }
-                if rest.starts_with(b"\r\n") {
-                    return Ok((Frame::BulkString(Some(Bytes::new())), rest.slice(2..)));
+                if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
+                    return Ok((Frame::BulkString(Some(Bytes::new())), after_crlf + 2));
                 } else {
                     return Err(ParseError::InvalidFormat);
                 }
             }
-            if rest.len() < len + 2 || &rest[len..len + 2] != b"\r\n" {
+            let data_start = after_crlf;
+            let data_end = data_start + len;
+            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
-            let chunk = rest.slice(..len);
-            let remaining = rest.slice(len + 2..);
-            Ok((Frame::BulkString(Some(chunk)), remaining))
+            Ok((
+                Frame::BulkString(Some(input.slice(data_start..data_end))),
+                data_end + 2,
+            ))
         }
         b'*' => {
-            // Fast path for empty array
-            if after_tag.starts_with(b"0\r\n") {
-                return Ok((Frame::Array(Some(Vec::new())), after_tag.slice(3..)));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            // null array: *-1\r\n
+            if len_bytes == b"-1" {
+                return Ok((Frame::Array(None), after_crlf));
             }
-            let (len_line, rest) = split_line(&after_tag)?;
-            let len_str = std::str::from_utf8(&len_line).map_err(|_| ParseError::Utf8Error)?;
-            if len_str == "-1" {
-                return Ok((Frame::Array(None), rest));
+            let count = parse_usize(len_bytes)?;
+            if count == 0 {
+                return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
-            let count: usize = len_str.parse().map_err(|_| ParseError::BadLength)?;
-            let mut cursor = rest;
+            let mut cursor = after_crlf;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (item, next) = parse_frame(cursor)?;
+                let (item, next) = parse_frame_inner(input, cursor)?;
                 items.push(item);
                 cursor = next;
             }
@@ -225,9 +238,11 @@ impl Parser {
 
         let bytes = self.buffer.split().freeze();
 
-        match parse_frame(bytes.clone()) {
-            Ok((frame, rest)) => {
-                self.buffer.unsplit(rest.into());
+        match parse_frame_inner(&bytes, 0) {
+            Ok((frame, consumed)) => {
+                if consumed < bytes.len() {
+                    self.buffer.unsplit(BytesMut::from(&bytes[consumed..]));
+                }
                 Ok(Some(frame))
             }
             Err(ParseError::Incomplete) => {
@@ -249,20 +264,69 @@ impl Parser {
     }
 }
 
-/// Find `\r\n` in the input, return the line (before) and rest (after).
-fn split_line(input: &Bytes) -> Result<(Bytes, Bytes), ParseError> {
-    let buf = input.as_ref();
-    let mut start = 0;
-    while let Some(idx) = buf[start..].iter().position(|&b| b == b'\r') {
-        let pos = start + idx;
-        if pos + 1 < buf.len() && buf[pos + 1] == b'\n' {
-            let line = input.slice(..pos);
-            let rest = input.slice(pos + 2..);
-            return Ok((line, rest));
+/// Find `\r\n` in `buf` starting at `from`. Returns `(line_end, after_crlf)` where
+/// `line_end` is the position of `\r` and `after_crlf` is the position after `\n`.
+#[inline]
+fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
+    let mut i = from;
+    let len = buf.len();
+    while i + 1 < len {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Ok((i, i + 2));
         }
-        start = pos + 1;
+        i += 1;
     }
     Err(ParseError::Incomplete)
+}
+
+/// Parse a `usize` directly from ASCII digit bytes, no UTF-8 validation needed.
+#[inline]
+fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
+    if buf.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    let mut v: usize = 0;
+    for &b in buf {
+        if !b.is_ascii_digit() {
+            return Err(ParseError::BadLength);
+        }
+        v = v.checked_mul(10).ok_or(ParseError::BadLength)?;
+        v = v
+            .checked_add((b - b'0') as usize)
+            .ok_or(ParseError::BadLength)?;
+    }
+    Ok(v)
+}
+
+/// Parse an `i64` directly from ASCII bytes (optional leading `-`), no UTF-8 validation.
+#[inline]
+fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
+    if buf.is_empty() {
+        return Err(ParseError::InvalidFormat);
+    }
+    let (neg, digits) = if buf[0] == b'-' {
+        (true, &buf[1..])
+    } else {
+        (false, buf)
+    };
+    if digits.is_empty() {
+        return Err(ParseError::InvalidFormat);
+    }
+    let mut v: i64 = 0;
+    for (i, &d) in digits.iter().enumerate() {
+        if !d.is_ascii_digit() {
+            return Err(ParseError::InvalidFormat);
+        }
+        let digit = (d - b'0') as i64;
+        if neg && v == i64::MAX / 10 && digit == 8 && i == digits.len() - 1 {
+            return Ok(i64::MIN);
+        }
+        if v > i64::MAX / 10 || (v == i64::MAX / 10 && digit > i64::MAX % 10) {
+            return Err(ParseError::Overflow);
+        }
+        v = v * 10 + digit;
+    }
+    if neg { Ok(-v) } else { Ok(v) }
 }
 
 #[cfg(test)]

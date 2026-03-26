@@ -15,7 +15,12 @@ thiserror = "2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+redis-protocol = { version = "6", features = ["resp2", "resp3", "bytes"] }
 
 [[bench]]
 name = "parsing"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
