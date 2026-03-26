@@ -6,11 +6,15 @@ on:
     paths-ignore:
       - "**.md"
       - "LICENSE-*"
+      - "cliff.toml"
+      - "release-plz.toml"
   pull_request:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "LICENSE-*"
+      - "cliff.toml"
+      - "release-plz.toml"
 
 env:
   CARGO_TERM_COLOR: always
