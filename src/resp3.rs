@@ -45,9 +45,11 @@ impl Parser {
 
         let bytes = self.buffer.split().freeze();
 
-        match parse_frame(bytes.clone()) {
-            Ok((frame, rest)) => {
-                self.buffer.unsplit(rest.into());
+        match parse_frame_inner(&bytes, 0) {
+            Ok((frame, consumed)) => {
+                if consumed < bytes.len() {
+                    self.buffer.unsplit(BytesMut::from(&bytes[consumed..]));
+                }
                 Ok(Some(frame))
             }
             Err(ParseError::Incomplete) => {
@@ -238,274 +240,209 @@ pub use crate::ParseError;
 ///
 /// Returns the parsed `Frame` and the remaining unconsumed `Bytes`, or a `ParseError` on failure.
 pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
-    if input.is_empty() {
+    let (frame, consumed) = parse_frame_inner(&input, 0)?;
+    Ok((frame, input.slice(consumed..)))
+}
+
+/// Offset-based internal parser. Works with byte positions to avoid creating
+/// intermediate `Bytes::slice()` objects. Only slices for actual frame data.
+fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
+    let buf = input.as_ref();
+    if pos >= buf.len() {
         return Err(ParseError::Incomplete);
     }
 
-    let tag = input[0];
-    let after_tag = input.slice(1..);
+    let tag = buf[pos];
 
     match tag {
         b'+' => {
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            Ok((Frame::SimpleString(line), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            Ok((
+                Frame::SimpleString(input.slice(pos + 1..line_end)),
+                after_crlf,
+            ))
         }
         b'-' => {
-            // Simple error: -<data>\r\n (zero-copy)
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            Ok((Frame::Error(line), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            Ok((Frame::Error(input.slice(pos + 1..line_end)), after_crlf))
         }
         b':' => {
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            let buf = line.as_ref();
-            let mut v: i64 = 0;
-            let mut neg = false;
-            let mut i = 0;
-            if i < buf.len() && buf[0] == b'-' {
-                neg = true;
-                i += 1;
-            }
-            while i < buf.len() {
-                let d = buf[i];
-                if !d.is_ascii_digit() {
-                    return Err(ParseError::InvalidFormat);
-                }
-                // Check for potential overflow before performing the operation
-                // Special case for i64::MIN: allow parsing -9223372036854775808
-                if neg && v == i64::MAX / 10 && (d - b'0') as i64 == 8 && i == buf.len() - 1 {
-                    // This will become i64::MIN after negation
-                    // Use a special value that will be recognized later
-                    v = i64::MAX;
-                } else if v > i64::MAX / 10
-                    || (v == i64::MAX / 10 && (d - b'0') as i64 > i64::MAX % 10)
-                {
-                    return Err(ParseError::Overflow);
-                } else {
-                    v = v * 10 + (d - b'0') as i64;
-                }
-                i += 1;
-            }
-            if neg {
-                // Special case for i64::MIN
-                if v == i64::MAX {
-                    v = i64::MIN;
-                } else {
-                    // Negate the value (we've already handled the special case for i64::MIN)
-                    v = -v;
-                }
-            }
-            Ok((Frame::Integer(v), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let v = parse_i64(&buf[pos + 1..line_end])?;
+            Ok((Frame::Integer(v), after_crlf))
         }
         b'$' => {
-            // Bulk string: $<len>\r\n<data>\r\n (zero-copy)
-            let (len_line, rest) = split_line_bytes(&after_tag)?;
-            let len_str = std::str::from_utf8(&len_line).map_err(|_| ParseError::Utf8Error)?;
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
             // streaming header?
-            if len_str == "?" {
-                return Ok((Frame::StreamedStringHeader, rest));
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedStringHeader, after_crlf));
             }
             // null bulk
-            if len_str == "-1" {
-                return Ok((Frame::BulkString(None), rest));
+            if len_bytes == b"-1" {
+                return Ok((Frame::BulkString(None), after_crlf));
             }
-            let len: usize = len_str.parse().map_err(|_| ParseError::BadLength)?;
+            let len = parse_usize(len_bytes)?;
             if len == 0 {
-                if rest.len() < 2 {
+                if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
                 }
-                if rest.starts_with(b"\r\n") {
-                    return Ok((Frame::BulkString(Some(Bytes::new())), rest.slice(2..)));
+                if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
+                    return Ok((Frame::BulkString(Some(Bytes::new())), after_crlf + 2));
                 } else {
                     return Err(ParseError::InvalidFormat);
                 }
             }
-            // ensure we have len + CRLF
-            if rest.len() < len + 2 || &rest[len..len + 2] != b"\r\n" {
+            let data_start = after_crlf;
+            let data_end = data_start + len;
+            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
-            // take the slice without copying
-            let chunk = rest.slice(..len);
-            let remaining = rest.slice(len + 2..);
-            Ok((Frame::BulkString(Some(chunk)), remaining))
+            Ok((
+                Frame::BulkString(Some(input.slice(data_start..data_end))),
+                data_end + 2,
+            ))
         }
         b'_' => {
-            if after_tag.starts_with(b"\r\n") {
-                Ok((Frame::Null, after_tag.slice(2..)))
+            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
+                Ok((Frame::Null, pos + 3))
             } else {
                 Err(ParseError::Incomplete)
             }
         }
         b',' => {
-            // Double or special float: ,<float>\r\n or ,inf/nan (zero-copy)
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            let buf = line.as_ref();
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let line_bytes = &buf[pos + 1..line_end];
             // special float cases
-            if buf == b"inf" || buf == b"-inf" || buf == b"nan" {
-                return Ok((Frame::SpecialFloat(line), rest));
+            if line_bytes == b"inf" || line_bytes == b"-inf" || line_bytes == b"nan" {
+                return Ok((
+                    Frame::SpecialFloat(input.slice(pos + 1..line_end)),
+                    after_crlf,
+                ));
             }
             // numeric double
-            let s = std::str::from_utf8(buf).map_err(|_| ParseError::Utf8Error)?;
+            let s = std::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
             let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
-            Ok((Frame::Double(v), rest))
+            Ok((Frame::Double(v), after_crlf))
         }
         b'#' => {
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            match &line[..] {
-                b"t" => Ok((Frame::Boolean(true), rest)),
-                b"f" => Ok((Frame::Boolean(false), rest)),
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            match &buf[pos + 1..line_end] {
+                b"t" => Ok((Frame::Boolean(true), after_crlf)),
+                b"f" => Ok((Frame::Boolean(false), after_crlf)),
                 _ => Err(ParseError::InvalidBoolean),
             }
         }
         b'(' => {
-            // Big number: (<digits>\r\n (zero-copy)
-            let (line, rest) = split_line_bytes(&after_tag)?;
-            Ok((Frame::BigNumber(line), rest))
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            Ok((Frame::BigNumber(input.slice(pos + 1..line_end)), after_crlf))
         }
         b'=' => {
-            // Parse verbatim string
-            let (len_line, rest) = split_line_bytes(&after_tag)?;
-
-            // Fast path for streaming header
-            if len_line.len() == 1 && len_line[0] == b'?' {
-                return Ok((Frame::StreamedVerbatimStringHeader, rest));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            // streaming header
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedVerbatimStringHeader, after_crlf));
             }
-
-            // Fast path for null case
-            if len_line.len() == 2 && len_line[0] == b'-' && len_line[1] == b'1' {
-                return Ok((Frame::VerbatimString(Bytes::new(), Bytes::new()), rest));
+            // null case
+            if len_bytes == b"-1" {
+                return Ok((
+                    Frame::VerbatimString(Bytes::new(), Bytes::new()),
+                    after_crlf,
+                ));
             }
-
-            // Parse length directly from bytes without UTF-8 validation
-            let mut len: usize = 0;
-            for &b in len_line.iter() {
-                if !b.is_ascii_digit() {
-                    // !(b'0'..=b'9').contains(&b) {
-                    return Err(ParseError::BadLength);
-                }
-                len = len * 10 + (b - b'0') as usize;
-            }
-
-            // Ensure we have full payload + CRLF
-            if rest.len() < len + 2 || &rest[len..len + 2] != b"\r\n" {
+            let len = parse_usize(len_bytes)?;
+            let data_start = after_crlf;
+            let data_end = data_start + len;
+            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
-
-            // Slice out payload and remainder
-            let payload = rest.slice(..len);
-            let remaining = rest.slice(len + 2..);
-
-            // Zero-copy split at the first colon
-            let sep = payload
-                .as_ref()
+            // find colon separator in payload
+            let sep = buf[data_start..data_end]
                 .iter()
                 .position(|&b| b == b':')
                 .ok_or(ParseError::InvalidFormat)?;
-            let format = payload.slice(..sep);
-            let content = payload.slice(sep + 1..);
-
-            Ok((Frame::VerbatimString(format, content), remaining))
+            let format = input.slice(data_start..data_start + sep);
+            let content = input.slice(data_start + sep + 1..data_end);
+            Ok((Frame::VerbatimString(format, content), data_end + 2))
         }
         b'!' => {
-            let (len_line, rest) = split_line_bytes(&after_tag)?;
-            let len_start = 1;
-            let len_end = 1 + len_line.len();
-            let len_str = std::str::from_utf8(&input[len_start..len_end])
-                .map_err(|_| ParseError::Utf8Error)?;
-            // handle streaming blob error header
-            if len_str == "?" {
-                return Ok((Frame::StreamedBlobErrorHeader, rest));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            // streaming blob error header
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedBlobErrorHeader, after_crlf));
             }
-            let len: isize = len_str.parse().map_err(|_| ParseError::BadLength)?;
-            if len == -1 {
-                // represent a null blob error as an empty Bytes
-                Ok((Frame::BlobError(Bytes::new()), rest))
-            } else {
-                let len = len as usize;
-                if rest.len() < len + 2 || &rest[len..len + 2] != b"\r\n" {
-                    return Err(ParseError::Incomplete);
-                }
-                let content_offset = 1 + len_line.len() + 2;
-                let content = input.slice(content_offset..content_offset + len);
-                let remaining = rest.slice(len + 2..);
-                Ok((Frame::BlobError(content), remaining))
+            if len_bytes == b"-1" {
+                return Ok((Frame::BlobError(Bytes::new()), after_crlf));
             }
+            let len = parse_usize(len_bytes)?;
+            let data_start = after_crlf;
+            let data_end = data_start + len;
+            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::Incomplete);
+            }
+            Ok((
+                Frame::BlobError(input.slice(data_start..data_end)),
+                data_end + 2,
+            ))
         }
         b'*' => {
-            // fast path for empty array: *0\r\n
-            if after_tag.starts_with(b"0\r\n") {
-                return Ok((Frame::Array(Some(Vec::new())), after_tag.slice(3..)));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedArrayHeader, after_crlf));
             }
-            let (line, rest_after_line) = split_line_bytes(&after_tag)?;
-            let count_str = std::str::from_utf8(&input[1..1 + line.len()])
-                .map_err(|_| ParseError::Utf8Error)?;
-            // handle streaming array header
-            if count_str == "?" {
-                return Ok((Frame::StreamedArrayHeader, rest_after_line));
+            if len_bytes == b"-1" {
+                return Ok((Frame::Array(None), after_crlf));
             }
-            let count: isize = count_str.parse().map_err(|_| ParseError::BadLength)?;
-            if count == -1 {
-                return Ok((Frame::Array(None), rest_after_line));
+            let count = parse_count(len_bytes)?;
+            if count == 0 {
+                return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
-            if count < 0 {
-                return Err(ParseError::BadLength);
-            }
-            let count_usize = count as usize;
-            if count_usize > MAX_COLLECTION_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let mut cursor = rest_after_line;
-            let mut items = Vec::with_capacity(count_usize);
+            let mut cursor = after_crlf;
+            let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (item, next_cursor) = parse_frame(cursor)?;
+                let (item, next) = parse_frame_inner(input, cursor)?;
                 items.push(item);
-                cursor = next_cursor;
+                cursor = next;
             }
             Ok((Frame::Array(Some(items)), cursor))
         }
         b'~' => {
-            let (line, rest_after_line) = split_line_bytes(&after_tag)?;
-            let count_str = std::str::from_utf8(&input[1..1 + line.len()])
-                .map_err(|_| ParseError::Utf8Error)?;
-            // handle streaming set header
-            if count_str == "?" {
-                return Ok((Frame::StreamedSetHeader, rest_after_line));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedSetHeader, after_crlf));
             }
-            let count: usize = count_str.parse().map_err(|_| ParseError::BadLength)?;
-            if count > MAX_COLLECTION_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let mut cursor = rest_after_line;
+            let count = parse_count(len_bytes)?;
+            let mut cursor = after_crlf;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (item, next_cursor) = parse_frame(cursor)?;
+                let (item, next) = parse_frame_inner(input, cursor)?;
                 items.push(item);
-                cursor = next_cursor;
+                cursor = next;
             }
             Ok((Frame::Set(items), cursor))
         }
         b'%' | b'|' => {
-            let (line, rest_after_line) = split_line_bytes(&after_tag)?;
-            let count_str = std::str::from_utf8(&input[1..1 + line.len()])
-                .map_err(|_| ParseError::Utf8Error)?;
-            // handle streaming map header
-            if tag == b'%' && count_str == "?" {
-                return Ok((Frame::StreamedMapHeader, rest_after_line));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            if len_bytes == b"?" {
+                return if tag == b'%' {
+                    Ok((Frame::StreamedMapHeader, after_crlf))
+                } else {
+                    Ok((Frame::StreamedAttributeHeader, after_crlf))
+                };
             }
-            // handle streaming attribute header
-            if tag == b'|' && count_str == "?" {
-                return Ok((Frame::StreamedAttributeHeader, rest_after_line));
-            }
-            let count: usize = count_str.parse().map_err(|_| ParseError::BadLength)?;
-            if count > MAX_COLLECTION_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let mut cursor = rest_after_line;
+            let count = parse_count(len_bytes)?;
+            let mut cursor = after_crlf;
             let mut pairs = Vec::with_capacity(count);
             for _ in 0..count {
-                let (key, cursor1) = parse_frame(cursor)?;
-                let (val, cursor2) = parse_frame(cursor1)?;
+                let (key, next1) = parse_frame_inner(input, cursor)?;
+                let (val, next2) = parse_frame_inner(input, next1)?;
                 pairs.push((key, val));
-                cursor = cursor2;
+                cursor = next2;
             }
             if tag == b'%' {
                 Ok((Frame::Map(pairs), cursor))
@@ -514,58 +451,47 @@ pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
             }
         }
         b'>' => {
-            let (line, rest_after_line) = split_line_bytes(&after_tag)?;
-            let count_str = std::str::from_utf8(&input[1..1 + line.len()])
-                .map_err(|_| ParseError::Utf8Error)?;
-            // handle streaming push header
-            if count_str == "?" {
-                return Ok((Frame::StreamedPushHeader, rest_after_line));
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len_bytes = &buf[pos + 1..line_end];
+            if len_bytes == b"?" {
+                return Ok((Frame::StreamedPushHeader, after_crlf));
             }
-            let count: usize = count_str.parse().map_err(|_| ParseError::BadLength)?;
-            if count > MAX_COLLECTION_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let mut cursor = rest_after_line;
+            let count = parse_count(len_bytes)?;
+            let mut cursor = after_crlf;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (item, next_cursor) = parse_frame(cursor)?;
+                let (item, next) = parse_frame_inner(input, cursor)?;
                 items.push(item);
-                cursor = next_cursor;
+                cursor = next;
             }
             Ok((Frame::Push(items), cursor))
         }
         b';' => {
-            // Streaming string chunk: ;length\r\ndata\r\n
-            let (len_line, rest) = split_line_bytes(&after_tag)?;
-            let len_str = std::str::from_utf8(&len_line).map_err(|_| ParseError::Utf8Error)?;
-            let len: usize = len_str.parse().map_err(|_| ParseError::BadLength)?;
-
+            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let len = parse_usize(&buf[pos + 1..line_end])?;
             if len == 0 {
-                if rest.len() < 2 {
+                if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
                 }
-                if rest.starts_with(b"\r\n") {
-                    return Ok((Frame::StreamedStringChunk(Bytes::new()), rest.slice(2..)));
+                if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
+                    return Ok((Frame::StreamedStringChunk(Bytes::new()), after_crlf + 2));
                 } else {
                     return Err(ParseError::InvalidFormat);
                 }
             }
-
-            // Ensure we have len + CRLF
-            if rest.len() < len + 2 || &rest[len..len + 2] != b"\r\n" {
+            let data_start = after_crlf;
+            let data_end = data_start + len;
+            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
-
-            // Extract the chunk data
-            let chunk = rest.slice(..len);
-            let remaining = rest.slice(len + 2..);
-            Ok((Frame::StreamedStringChunk(chunk), remaining))
+            Ok((
+                Frame::StreamedStringChunk(input.slice(data_start..data_end)),
+                data_end + 2,
+            ))
         }
         b'.' => {
-            // End-of-stream terminator: .\r\n
-            if after_tag.starts_with(b"\r\n") {
-                // consume the CRLF and return the terminator
-                Ok((Frame::StreamTerminator, after_tag.slice(2..)))
+            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
+                Ok((Frame::StreamTerminator, pos + 3))
             } else {
                 Err(ParseError::Incomplete)
             }
@@ -865,19 +791,79 @@ pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseErr
     }
 }
 
-fn split_line_bytes(input: &Bytes) -> Result<(Bytes, Bytes), ParseError> {
-    let buf = input.as_ref();
-    let mut start = 0;
-    while let Some(idx) = buf[start..].iter().position(|&b| b == b'\r') {
-        let pos = start + idx;
-        if pos + 1 < buf.len() && buf[pos + 1] == b'\n' {
-            let line = input.slice(..pos);
-            let rest = input.slice(pos + 2..);
-            return Ok((line, rest));
+/// Find `\r\n` in `buf` starting at `from`. Returns `(line_end, after_crlf)` where
+/// `line_end` is the position of `\r` and `after_crlf` is the position after `\n`.
+#[inline]
+fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
+    let mut i = from;
+    let len = buf.len();
+    while i + 1 < len {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Ok((i, i + 2));
         }
-        start = pos + 1;
+        i += 1;
     }
     Err(ParseError::Incomplete)
+}
+
+/// Parse a `usize` directly from ASCII digit bytes, no UTF-8 validation needed.
+#[inline]
+fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
+    if buf.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    let mut v: usize = 0;
+    for &b in buf {
+        if !b.is_ascii_digit() {
+            return Err(ParseError::BadLength);
+        }
+        v = v.checked_mul(10).ok_or(ParseError::BadLength)?;
+        v = v
+            .checked_add((b - b'0') as usize)
+            .ok_or(ParseError::BadLength)?;
+    }
+    Ok(v)
+}
+
+/// Parse an `i64` directly from ASCII bytes (optional leading `-`), no UTF-8 validation.
+#[inline]
+fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
+    if buf.is_empty() {
+        return Err(ParseError::InvalidFormat);
+    }
+    let (neg, digits) = if buf[0] == b'-' {
+        (true, &buf[1..])
+    } else {
+        (false, buf)
+    };
+    if digits.is_empty() {
+        return Err(ParseError::InvalidFormat);
+    }
+    let mut v: i64 = 0;
+    for (i, &d) in digits.iter().enumerate() {
+        if !d.is_ascii_digit() {
+            return Err(ParseError::InvalidFormat);
+        }
+        let digit = (d - b'0') as i64;
+        if neg && v == i64::MAX / 10 && digit == 8 && i == digits.len() - 1 {
+            return Ok(i64::MIN);
+        }
+        if v > i64::MAX / 10 || (v == i64::MAX / 10 && digit > i64::MAX % 10) {
+            return Err(ParseError::Overflow);
+        }
+        v = v * 10 + digit;
+    }
+    if neg { Ok(-v) } else { Ok(v) }
+}
+
+/// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.
+#[inline]
+fn parse_count(buf: &[u8]) -> Result<usize, ParseError> {
+    let count = parse_usize(buf)?;
+    if count > MAX_COLLECTION_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    Ok(count)
 }
 
 /// Converts a Frame to its RESP3 byte representation.
