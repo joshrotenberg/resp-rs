@@ -1,6 +1,6 @@
 [package]
 name = "resp-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Zero-copy RESP2 and RESP3 protocol parser and serializer"
 license = "MIT OR Apache-2.0"
