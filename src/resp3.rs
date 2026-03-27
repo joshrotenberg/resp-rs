@@ -272,8 +272,254 @@ pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
     Ok((frame, input.slice(consumed..)))
 }
 
-/// Offset-based internal parser. Works with byte positions to avoid creating
-/// intermediate `Bytes::slice()` objects. Only slices for actual frame data.
+/// Parse a length-prefixed blob: shared logic for bulk string, blob error, and
+/// streamed string chunks. Returns `(data_start, data_end, after_crlf)` on success.
+#[inline(never)]
+fn parse_blob_bounds(
+    buf: &[u8],
+    after_crlf: usize,
+    len: usize,
+) -> Result<(usize, usize), ParseError> {
+    if len == 0 {
+        if after_crlf + 1 >= buf.len() {
+            return Err(ParseError::Incomplete);
+        }
+        if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
+            return Ok((after_crlf, after_crlf));
+        } else {
+            return Err(ParseError::InvalidFormat);
+        }
+    }
+    let data_start = after_crlf;
+    let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
+    if data_end + 1 >= buf.len() {
+        return Err(ParseError::Incomplete);
+    }
+    if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+        return Err(ParseError::InvalidFormat);
+    }
+    Ok((data_start, data_end))
+}
+
+/// Parse a bulk string frame (`$`).
+fn parse_bulk_string(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len_bytes = &buf[pos + 1..line_end];
+    if len_bytes == b"?" {
+        return Ok((Frame::StreamedStringHeader, after_crlf));
+    }
+    if len_bytes == b"-1" {
+        return Ok((Frame::BulkString(None), after_crlf));
+    }
+    let len = parse_usize(len_bytes)?;
+    if len > MAX_BULK_STRING_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    let (data_start, data_end) = parse_blob_bounds(buf, after_crlf, len)?;
+    if data_start == data_end {
+        Ok((Frame::BulkString(Some(Bytes::new())), after_crlf + 2))
+    } else {
+        Ok((
+            Frame::BulkString(Some(input.slice(data_start..data_end))),
+            data_end + 2,
+        ))
+    }
+}
+
+/// Parse a double frame (`,`).
+#[inline(never)]
+fn parse_double_frame(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let line_bytes = &buf[pos + 1..line_end];
+    if line_bytes == b"inf" || line_bytes == b"-inf" || line_bytes == b"nan" {
+        return Ok((
+            Frame::SpecialFloat(input.slice(pos + 1..line_end)),
+            after_crlf,
+        ));
+    }
+    let s = std::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
+    let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
+    if v.is_infinite() || v.is_nan() {
+        let canonical = if v.is_nan() {
+            "nan"
+        } else if v.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        };
+        return Ok((Frame::SpecialFloat(Bytes::from(canonical)), after_crlf));
+    }
+    Ok((Frame::Double(v), after_crlf))
+}
+
+/// Parse a verbatim string frame (`=`).
+#[inline(never)]
+fn parse_verbatim(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len_bytes = &buf[pos + 1..line_end];
+    if len_bytes == b"?" {
+        return Ok((Frame::StreamedVerbatimStringHeader, after_crlf));
+    }
+    if len_bytes == b"-1" {
+        return Err(ParseError::BadLength);
+    }
+    let len = parse_usize(len_bytes)?;
+    if len > MAX_BULK_STRING_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    let data_start = after_crlf;
+    let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
+    if data_end + 1 >= buf.len() {
+        return Err(ParseError::Incomplete);
+    }
+    if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+        return Err(ParseError::InvalidFormat);
+    }
+    let sep = buf[data_start..data_end]
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or(ParseError::InvalidFormat)?;
+    if sep != 3 {
+        return Err(ParseError::InvalidFormat);
+    }
+    let format = input.slice(data_start..data_start + sep);
+    let content = input.slice(data_start + sep + 1..data_end);
+    Ok((Frame::VerbatimString(format, content), data_end + 2))
+}
+
+/// Parse a blob error frame (`!`).
+#[inline(never)]
+fn parse_blob_error(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len_bytes = &buf[pos + 1..line_end];
+    if len_bytes == b"?" {
+        return Ok((Frame::StreamedBlobErrorHeader, after_crlf));
+    }
+    if len_bytes == b"-1" {
+        return Err(ParseError::BadLength);
+    }
+    let len = parse_usize(len_bytes)?;
+    if len > MAX_BULK_STRING_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    let (data_start, data_end) = parse_blob_bounds(buf, after_crlf, len)?;
+    if data_start == data_end {
+        Ok((Frame::BlobError(Bytes::new()), after_crlf + 2))
+    } else {
+        Ok((
+            Frame::BlobError(input.slice(data_start..data_end)),
+            data_end + 2,
+        ))
+    }
+}
+
+/// Parse a collection (array, set, push) with element count.
+#[inline(never)]
+fn parse_collection(
+    input: &Bytes,
+    buf: &[u8],
+    pos: usize,
+    tag: u8,
+) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len_bytes = &buf[pos + 1..line_end];
+
+    // Streaming headers
+    if len_bytes == b"?" {
+        return match tag {
+            b'*' => Ok((Frame::StreamedArrayHeader, after_crlf)),
+            b'~' => Ok((Frame::StreamedSetHeader, after_crlf)),
+            b'>' => Ok((Frame::StreamedPushHeader, after_crlf)),
+            _ => unreachable!(),
+        };
+    }
+    // Null array
+    if tag == b'*' && len_bytes == b"-1" {
+        return Ok((Frame::Array(None), after_crlf));
+    }
+    let count = parse_count(len_bytes)?;
+    if count == 0 {
+        return match tag {
+            b'*' => Ok((Frame::Array(Some(Vec::new())), after_crlf)),
+            b'~' => Ok((Frame::Set(Vec::new()), after_crlf)),
+            b'>' => Ok((Frame::Push(Vec::new()), after_crlf)),
+            _ => unreachable!(),
+        };
+    }
+    let mut cursor = after_crlf;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (item, next) = parse_frame_inner(input, cursor)?;
+        items.push(item);
+        cursor = next;
+    }
+    match tag {
+        b'*' => Ok((Frame::Array(Some(items)), cursor)),
+        b'~' => Ok((Frame::Set(items), cursor)),
+        b'>' => Ok((Frame::Push(items), cursor)),
+        _ => unreachable!(),
+    }
+}
+
+/// Parse a map or attribute (`%` / `|`).
+#[inline(never)]
+fn parse_pairs(
+    input: &Bytes,
+    buf: &[u8],
+    pos: usize,
+    tag: u8,
+) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len_bytes = &buf[pos + 1..line_end];
+    if len_bytes == b"?" {
+        return if tag == b'%' {
+            Ok((Frame::StreamedMapHeader, after_crlf))
+        } else {
+            Ok((Frame::StreamedAttributeHeader, after_crlf))
+        };
+    }
+    let count = parse_count(len_bytes)?;
+    let mut cursor = after_crlf;
+    let mut pairs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (key, next1) = parse_frame_inner(input, cursor)?;
+        let (val, next2) = parse_frame_inner(input, next1)?;
+        pairs.push((key, val));
+        cursor = next2;
+    }
+    if tag == b'%' {
+        Ok((Frame::Map(pairs), cursor))
+    } else {
+        Ok((Frame::Attribute(pairs), cursor))
+    }
+}
+
+/// Parse a streamed string chunk (`;`).
+#[inline(never)]
+fn parse_streamed_chunk(
+    input: &Bytes,
+    buf: &[u8],
+    pos: usize,
+) -> Result<(Frame, usize), ParseError> {
+    let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+    let len = parse_usize(&buf[pos + 1..line_end])?;
+    if len > MAX_BULK_STRING_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    let (data_start, data_end) = parse_blob_bounds(buf, after_crlf, len)?;
+    if data_start == data_end {
+        Ok((Frame::StreamedStringChunk(Bytes::new()), after_crlf + 2))
+    } else {
+        Ok((
+            Frame::StreamedStringChunk(input.slice(data_start..data_end)),
+            data_end + 2,
+        ))
+    }
+}
+
+/// Offset-based internal parser. The match body is kept minimal to reduce
+/// instruction-cache pressure; heavy arms are extracted into `#[inline(never)]`
+/// helpers so the hot dispatch stays small.
 fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
     let buf = input.as_ref();
     if pos >= buf.len() {
@@ -283,6 +529,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
     let tag = buf[pos];
 
     match tag {
+        // Line-based types (small, stay inline)
         b'+' => {
             let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
             Ok((
@@ -299,78 +546,6 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             let v = parse_i64(&buf[pos + 1..line_end])?;
             Ok((Frame::Integer(v), after_crlf))
         }
-        b'$' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            // streaming header?
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedStringHeader, after_crlf));
-            }
-            // null bulk
-            if len_bytes == b"-1" {
-                return Ok((Frame::BulkString(None), after_crlf));
-            }
-            let len = parse_usize(len_bytes)?;
-            if len > MAX_BULK_STRING_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            if len == 0 {
-                if after_crlf + 1 >= buf.len() {
-                    return Err(ParseError::Incomplete);
-                }
-                if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
-                    return Ok((Frame::BulkString(Some(Bytes::new())), after_crlf + 2));
-                } else {
-                    return Err(ParseError::InvalidFormat);
-                }
-            }
-            let data_start = after_crlf;
-            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() {
-                return Err(ParseError::Incomplete);
-            }
-            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
-                return Err(ParseError::InvalidFormat);
-            }
-            Ok((
-                Frame::BulkString(Some(input.slice(data_start..data_end))),
-                data_end + 2,
-            ))
-        }
-        b'_' => {
-            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
-                Ok((Frame::Null, pos + 3))
-            } else {
-                Err(ParseError::Incomplete)
-            }
-        }
-        b',' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let line_bytes = &buf[pos + 1..line_end];
-            // special float cases
-            if line_bytes == b"inf" || line_bytes == b"-inf" || line_bytes == b"nan" {
-                return Ok((
-                    Frame::SpecialFloat(input.slice(pos + 1..line_end)),
-                    after_crlf,
-                ));
-            }
-            // numeric double
-            let s = std::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
-            let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
-            // Rust's f64::parse accepts case-insensitive "inf"/"infinity"/"nan".
-            // Normalize these to SpecialFloat for consistent roundtripping.
-            if v.is_infinite() || v.is_nan() {
-                let canonical = if v.is_nan() {
-                    "nan"
-                } else if v.is_sign_negative() {
-                    "-inf"
-                } else {
-                    "inf"
-                };
-                return Ok((Frame::SpecialFloat(Bytes::from(canonical)), after_crlf));
-            }
-            Ok((Frame::Double(v), after_crlf))
-        }
         b'#' => {
             let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
             match &buf[pos + 1..line_end] {
@@ -383,174 +558,12 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
             Ok((Frame::BigNumber(input.slice(pos + 1..line_end)), after_crlf))
         }
-        b'=' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            // streaming header
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedVerbatimStringHeader, after_crlf));
-            }
-            if len_bytes == b"-1" {
-                return Err(ParseError::BadLength);
-            }
-            let len = parse_usize(len_bytes)?;
-            if len > MAX_BULK_STRING_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let data_start = after_crlf;
-            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() {
-                return Err(ParseError::Incomplete);
-            }
-            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
-                return Err(ParseError::InvalidFormat);
-            }
-            // find colon separator in payload
-            let sep = buf[data_start..data_end]
-                .iter()
-                .position(|&b| b == b':')
-                .ok_or(ParseError::InvalidFormat)?;
-            if sep != 3 {
-                return Err(ParseError::InvalidFormat);
-            }
-            let format = input.slice(data_start..data_start + sep);
-            let content = input.slice(data_start + sep + 1..data_end);
-            Ok((Frame::VerbatimString(format, content), data_end + 2))
-        }
-        b'!' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            // streaming blob error header
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedBlobErrorHeader, after_crlf));
-            }
-            if len_bytes == b"-1" {
-                return Err(ParseError::BadLength);
-            }
-            let len = parse_usize(len_bytes)?;
-            if len > MAX_BULK_STRING_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            let data_start = after_crlf;
-            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() {
-                return Err(ParseError::Incomplete);
-            }
-            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
-                return Err(ParseError::InvalidFormat);
-            }
-            Ok((
-                Frame::BlobError(input.slice(data_start..data_end)),
-                data_end + 2,
-            ))
-        }
-        b'*' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedArrayHeader, after_crlf));
-            }
-            if len_bytes == b"-1" {
-                return Ok((Frame::Array(None), after_crlf));
-            }
-            let count = parse_count(len_bytes)?;
-            if count == 0 {
-                return Ok((Frame::Array(Some(Vec::new())), after_crlf));
-            }
-            let mut cursor = after_crlf;
-            let mut items = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (item, next) = parse_frame_inner(input, cursor)?;
-                items.push(item);
-                cursor = next;
-            }
-            Ok((Frame::Array(Some(items)), cursor))
-        }
-        b'~' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedSetHeader, after_crlf));
-            }
-            let count = parse_count(len_bytes)?;
-            let mut cursor = after_crlf;
-            let mut items = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (item, next) = parse_frame_inner(input, cursor)?;
-                items.push(item);
-                cursor = next;
-            }
-            Ok((Frame::Set(items), cursor))
-        }
-        b'%' | b'|' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            if len_bytes == b"?" {
-                return if tag == b'%' {
-                    Ok((Frame::StreamedMapHeader, after_crlf))
-                } else {
-                    Ok((Frame::StreamedAttributeHeader, after_crlf))
-                };
-            }
-            let count = parse_count(len_bytes)?;
-            let mut cursor = after_crlf;
-            let mut pairs = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (key, next1) = parse_frame_inner(input, cursor)?;
-                let (val, next2) = parse_frame_inner(input, next1)?;
-                pairs.push((key, val));
-                cursor = next2;
-            }
-            if tag == b'%' {
-                Ok((Frame::Map(pairs), cursor))
+        b'_' => {
+            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
+                Ok((Frame::Null, pos + 3))
             } else {
-                Ok((Frame::Attribute(pairs), cursor))
+                Err(ParseError::Incomplete)
             }
-        }
-        b'>' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len_bytes = &buf[pos + 1..line_end];
-            if len_bytes == b"?" {
-                return Ok((Frame::StreamedPushHeader, after_crlf));
-            }
-            let count = parse_count(len_bytes)?;
-            let mut cursor = after_crlf;
-            let mut items = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (item, next) = parse_frame_inner(input, cursor)?;
-                items.push(item);
-                cursor = next;
-            }
-            Ok((Frame::Push(items), cursor))
-        }
-        b';' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
-            let len = parse_usize(&buf[pos + 1..line_end])?;
-            if len > MAX_BULK_STRING_SIZE {
-                return Err(ParseError::BadLength);
-            }
-            if len == 0 {
-                if after_crlf + 1 >= buf.len() {
-                    return Err(ParseError::Incomplete);
-                }
-                if buf[after_crlf] == b'\r' && buf[after_crlf + 1] == b'\n' {
-                    return Ok((Frame::StreamedStringChunk(Bytes::new()), after_crlf + 2));
-                } else {
-                    return Err(ParseError::InvalidFormat);
-                }
-            }
-            let data_start = after_crlf;
-            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() {
-                return Err(ParseError::Incomplete);
-            }
-            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
-                return Err(ParseError::InvalidFormat);
-            }
-            Ok((
-                Frame::StreamedStringChunk(input.slice(data_start..data_end)),
-                data_end + 2,
-            ))
         }
         b'.' => {
             if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
@@ -559,6 +572,18 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 Err(ParseError::Incomplete)
             }
         }
+
+        // Length-prefixed types (extracted to reduce icache pressure)
+        b'$' => parse_bulk_string(input, buf, pos),
+        b',' => parse_double_frame(input, buf, pos),
+        b'=' => parse_verbatim(input, buf, pos),
+        b'!' => parse_blob_error(input, buf, pos),
+        b';' => parse_streamed_chunk(input, buf, pos),
+
+        // Collections (extracted)
+        b'*' | b'~' | b'>' => parse_collection(input, buf, pos, tag),
+        b'%' | b'|' => parse_pairs(input, buf, pos, tag),
+
         _ => Err(ParseError::InvalidTag(tag)),
     }
 }
