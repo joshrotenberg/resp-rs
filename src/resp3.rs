@@ -667,74 +667,10 @@ pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseErr
 
             Ok((Frame::StreamedString(chunks), rest))
         }
-        Frame::StreamedBlobErrorHeader => {
-            // Parse streaming blob error chunks until zero-length chunk
-            // Similar to StreamedStringHeader but for blob errors
-            let mut chunks = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::BlobError(chunk) => {
-                        // Check for terminator by parsing as bulk string
-                        // In streaming context, !0\r\n acts as terminator
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        chunks.push(chunk);
-                    }
-                    _ => {
-                        return Err(ParseError::InvalidFormat);
-                    }
-                }
-            }
-
-            // Concatenate all error chunks
-            let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-            let mut combined = Vec::with_capacity(total_len);
-            for chunk in chunks {
-                combined.extend_from_slice(&chunk);
-            }
-            Ok((Frame::BlobError(Bytes::from(combined)), rest))
-        }
-        Frame::StreamedVerbatimStringHeader => {
-            // Parse streaming verbatim string chunks until zero-length chunk
-            let mut chunks = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::VerbatimString(format, content) => {
-                        // Zero-length content indicates end of stream
-                        if content.is_empty() && format.len() == 3 {
-                            break;
-                        }
-                        // For now, just collect the content parts
-                        // In a full implementation, we'd validate format consistency
-                        chunks.push((format, content));
-                    }
-                    _ => {
-                        return Err(ParseError::InvalidFormat);
-                    }
-                }
-            }
-
-            // Concatenate all chunks, using format from first chunk
-            if chunks.is_empty() {
-                return Ok((Frame::VerbatimString(Bytes::new(), Bytes::new()), rest));
-            }
-
-            let format = chunks[0].0.clone();
-            let total_len: usize = chunks.iter().map(|(_, c)| c.len()).sum();
-            let mut combined = Vec::with_capacity(total_len);
-            for (_, content) in chunks {
-                combined.extend_from_slice(&content);
-            }
-            Ok((Frame::VerbatimString(format, Bytes::from(combined)), rest))
+        Frame::StreamedBlobErrorHeader | Frame::StreamedVerbatimStringHeader => {
+            // RESP3 does not define a streaming chunk format for blob errors
+            // or verbatim strings. Return the header as-is for low-level consumers.
+            Ok((header, rest))
         }
         Frame::StreamedArrayHeader => {
             // Parse streaming array items until terminator
@@ -790,6 +726,9 @@ pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseErr
                     }
                     key => {
                         let (value, newer_rest) = parse_frame(rest)?;
+                        if matches!(value, Frame::StreamTerminator) {
+                            return Err(ParseError::InvalidFormat);
+                        }
                         rest = newer_rest;
                         pairs.push((key, value));
                     }
@@ -812,6 +751,9 @@ pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseErr
                     }
                     key => {
                         let (value, newer_rest) = parse_frame(rest)?;
+                        if matches!(value, Frame::StreamTerminator) {
+                            return Err(ParseError::InvalidFormat);
+                        }
                         rest = newer_rest;
                         pairs.push((key, value));
                     }
@@ -2018,10 +1960,10 @@ mod tests {
             assert!(items.is_empty());
         }
 
-        // Test streaming map with odd number of elements (should work)
+        // Test streaming map with odd number of elements
         let data = Bytes::from("%?\r\n+key1\r\n+val1\r\n+orphan\r\n.\r\n");
         let result = parse_streaming_sequence(data);
-        assert!(matches!(result, Err(ParseError::Incomplete)));
+        assert!(matches!(result, Err(ParseError::InvalidFormat)));
 
         // Test non-streaming frame passed to parse_streaming_sequence
         let data = Bytes::from("+simple\r\n");
@@ -2279,5 +2221,98 @@ mod tests {
         parser.feed(Bytes::from("+OK\r\n"));
         let frame = parser.next_frame().unwrap().unwrap();
         assert_eq!(frame, Frame::SimpleString(Bytes::from("OK")));
+    }
+
+    #[test]
+    fn test_streaming_set_roundtrip() {
+        let data = Bytes::from("~?\r\n+a\r\n+b\r\n+c\r\n.\r\n");
+        let (frame, rest) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(
+            frame,
+            Frame::StreamedSet(vec![
+                Frame::SimpleString(Bytes::from("a")),
+                Frame::SimpleString(Bytes::from("b")),
+                Frame::SimpleString(Bytes::from("c")),
+            ])
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_attribute_roundtrip() {
+        let data = Bytes::from("|?\r\n+key\r\n+val\r\n.\r\n");
+        let (frame, rest) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(
+            frame,
+            Frame::StreamedAttribute(vec![(
+                Frame::SimpleString(Bytes::from("key")),
+                Frame::SimpleString(Bytes::from("val")),
+            )])
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_push_roundtrip() {
+        let data = Bytes::from(">?\r\n+pubsub\r\n+channel\r\n+message\r\n.\r\n");
+        let (frame, rest) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(
+            frame,
+            Frame::StreamedPush(vec![
+                Frame::SimpleString(Bytes::from("pubsub")),
+                Frame::SimpleString(Bytes::from("channel")),
+                Frame::SimpleString(Bytes::from("message")),
+            ])
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_empty_streaming_containers() {
+        // Empty streaming string
+        let data = Bytes::from("$?\r\n;0\r\n\r\n");
+        let (frame, _) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedString(vec![]));
+
+        // Empty streaming array
+        let data = Bytes::from("*?\r\n.\r\n");
+        let (frame, _) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedArray(vec![]));
+
+        // Empty streaming set
+        let data = Bytes::from("~?\r\n.\r\n");
+        let (frame, _) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedSet(vec![]));
+
+        // Empty streaming map
+        let data = Bytes::from("%?\r\n.\r\n");
+        let (frame, _) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedMap(vec![]));
+    }
+
+    #[test]
+    fn test_streaming_attribute_odd_elements_errors() {
+        let data = Bytes::from("|?\r\n+key\r\n+val\r\n+orphan\r\n.\r\n");
+        let result = parse_streaming_sequence(data);
+        assert!(matches!(result, Err(ParseError::InvalidFormat)));
+    }
+
+    #[test]
+    fn test_streaming_blob_error_header_passthrough() {
+        // Blob error streaming is not supported; header is passed through
+        let data = Bytes::from("!?\r\n!5\r\nERROR\r\n");
+        let (frame, rest) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedBlobErrorHeader);
+        // Rest contains the subsequent data
+        assert!(!rest.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_verbatim_header_passthrough() {
+        // Verbatim string streaming is not supported; header is passed through
+        let data = Bytes::from("=?\r\n=9\r\ntxt:hello\r\n");
+        let (frame, rest) = parse_streaming_sequence(data).unwrap();
+        assert_eq!(frame, Frame::StreamedVerbatimStringHeader);
+        assert!(!rest.is_empty());
     }
 }
