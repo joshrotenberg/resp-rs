@@ -155,6 +155,12 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
     }
 }
 
+#[cfg(feature = "unsafe-internals")]
+#[path = "resp2_unchecked.rs"]
+mod unchecked;
+#[cfg(feature = "unsafe-internals")]
+pub use unchecked::parse_frame_unchecked;
+
 /// Serialize a RESP2 frame to bytes.
 ///
 /// # Examples

@@ -12,6 +12,9 @@ keywords = ["redis", "resp", "protocol", "parser", "resp3"]
 categories = ["parser-implementations", "network-programming"]
 rust-version = "1.85"
 
+[features]
+unsafe-internals = []
+
 [dependencies]
 bytes = "1"
 thiserror = "2"
@@ -27,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "comparison"
+harness = false
+
+[[bench]]
+name = "unsafe_experiment"
 harness = false
