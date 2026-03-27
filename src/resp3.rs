@@ -5,9 +5,11 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// Maximum reasonable size for collections to prevent DoS attacks
-/// Set to 10 million elements (reasonable for real-world Redis usage)
+/// Maximum reasonable size for collections to prevent DoS attacks.
 const MAX_COLLECTION_SIZE: usize = 10_000_000;
+
+/// Maximum reasonable size for bulk string/blob/chunk payloads (512 MB).
+const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 
 /// A streaming parser for RESP3 frames.
 ///
@@ -56,7 +58,11 @@ impl Parser {
                 self.buffer.unsplit(bytes.into());
                 Ok(None)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Buffer was emptied by split() above; intentionally not restored
+                // on hard errors so the parser doesn't re-parse corrupt data.
+                Err(e)
+            }
         }
     }
 
@@ -283,6 +289,9 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 return Ok((Frame::BulkString(None), after_crlf));
             }
             let len = parse_usize(len_bytes)?;
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::BadLength);
+            }
             if len == 0 {
                 if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
@@ -295,8 +304,11 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             }
             let data_start = after_crlf;
             let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+            if data_end + 1 >= buf.len() {
                 return Err(ParseError::Incomplete);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::InvalidFormat);
             }
             Ok((
                 Frame::BulkString(Some(input.slice(data_start..data_end))),
@@ -364,10 +376,16 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 ));
             }
             let len = parse_usize(len_bytes)?;
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::BadLength);
+            }
             let data_start = after_crlf;
             let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+            if data_end + 1 >= buf.len() {
                 return Err(ParseError::Incomplete);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::InvalidFormat);
             }
             // find colon separator in payload
             let sep = buf[data_start..data_end]
@@ -389,10 +407,16 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 return Ok((Frame::BlobError(Bytes::new()), after_crlf));
             }
             let len = parse_usize(len_bytes)?;
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::BadLength);
+            }
             let data_start = after_crlf;
             let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+            if data_end + 1 >= buf.len() {
                 return Err(ParseError::Incomplete);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::InvalidFormat);
             }
             Ok((
                 Frame::BlobError(input.slice(data_start..data_end)),
@@ -481,6 +505,9 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
         b';' => {
             let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
             let len = parse_usize(&buf[pos + 1..line_end])?;
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::BadLength);
+            }
             if len == 0 {
                 if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
@@ -493,8 +520,11 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             }
             let data_start = after_crlf;
             let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+            if data_end + 1 >= buf.len() {
                 return Err(ParseError::Incomplete);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::InvalidFormat);
             }
             Ok((
                 Frame::StreamedStringChunk(input.slice(data_start..data_end)),
@@ -2078,5 +2108,139 @@ mod tests {
         let mut parser = Parser::new();
         parser.feed(Bytes::from("+HELL"));
         assert_eq!(parser.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn test_integer_negative_overflow() {
+        // One past i64::MIN
+        assert!(parse_frame(Bytes::from(":-9223372036854775809\r\n")).is_err());
+    }
+
+    #[test]
+    fn test_nonempty_bulk_malformed_terminator() {
+        // Not enough data after payload
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfoo")),
+            Err(ParseError::Incomplete)
+        );
+        // Only one byte after payload
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfooX")),
+            Err(ParseError::Incomplete)
+        );
+        // Two bytes present but wrong
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfooXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn test_blob_error_malformed_terminator() {
+        assert_eq!(
+            parse_frame(Bytes::from("!3\r\nerr")),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(
+            parse_frame(Bytes::from("!3\r\nerrXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn test_verbatim_string_malformed_terminator() {
+        assert_eq!(
+            parse_frame(Bytes::from("=8\r\ntxt:data")),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(
+            parse_frame(Bytes::from("=8\r\ntxt:dataXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn test_streamed_chunk_malformed_terminator() {
+        assert_eq!(
+            parse_frame(Bytes::from(";3\r\nabc")),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(
+            parse_frame(Bytes::from(";3\r\nabcXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn test_bulk_string_size_limit() {
+        // Over MAX_BULK_STRING_SIZE (512 MB)
+        assert_eq!(
+            parse_frame(Bytes::from("$536870913\r\n")),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn test_blob_error_size_limit() {
+        assert_eq!(
+            parse_frame(Bytes::from("!536870913\r\n")),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn test_verbatim_string_size_limit() {
+        assert_eq!(
+            parse_frame(Bytes::from("=536870913\r\n")),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn test_streamed_chunk_size_limit() {
+        assert_eq!(
+            parse_frame(Bytes::from(";536870913\r\n")),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn test_invalid_double() {
+        assert_eq!(
+            parse_frame(Bytes::from(",foo\r\n")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn test_invalid_boolean() {
+        assert_eq!(
+            parse_frame(Bytes::from("#\r\n")),
+            Err(ParseError::InvalidBoolean)
+        );
+        assert_eq!(
+            parse_frame(Bytes::from("#true\r\n")),
+            Err(ParseError::InvalidBoolean)
+        );
+    }
+
+    #[test]
+    fn test_parser_clears_buffer_on_error() {
+        let mut parser = Parser::new();
+        parser.feed(Bytes::from("X\r\n"));
+        assert_eq!(parser.next_frame(), Err(ParseError::InvalidTag(b'X')));
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_parser_recovers_after_error() {
+        let mut parser = Parser::new();
+        parser.feed(Bytes::from("X\r\n"));
+        assert!(parser.next_frame().is_err());
+        assert_eq!(parser.buffered_bytes(), 0);
+
+        parser.feed(Bytes::from("+OK\r\n"));
+        let frame = parser.next_frame().unwrap().unwrap();
+        assert_eq!(frame, Frame::SimpleString(Bytes::from("OK")));
     }
 }

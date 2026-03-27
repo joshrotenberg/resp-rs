@@ -14,6 +14,9 @@ use crate::ParseError;
 /// Maximum reasonable size for collections to prevent DoS attacks.
 const MAX_COLLECTION_SIZE: usize = 10_000_000;
 
+/// Maximum reasonable size for bulk string payloads (512 MB).
+const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
+
 /// A parsed RESP2 frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
@@ -88,6 +91,9 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 return Ok((Frame::BulkString(None), after_crlf));
             }
             let len = parse_usize(len_bytes)?;
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::BadLength);
+            }
             if len == 0 {
                 if after_crlf + 1 >= buf.len() {
                     return Err(ParseError::Incomplete);
@@ -100,8 +106,11 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             }
             let data_start = after_crlf;
             let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
-            if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+            if data_end + 1 >= buf.len() {
                 return Err(ParseError::Incomplete);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err(ParseError::InvalidFormat);
             }
             Ok((
                 Frame::BulkString(Some(input.slice(data_start..data_end))),
@@ -115,10 +124,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             if len_bytes == b"-1" {
                 return Ok((Frame::Array(None), after_crlf));
             }
-            let count = parse_usize(len_bytes)?;
-            if count > MAX_COLLECTION_SIZE {
-                return Err(ParseError::BadLength);
-            }
+            let count = parse_count(len_bytes)?;
             if count == 0 {
                 return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
@@ -255,7 +261,11 @@ impl Parser {
                 self.buffer.unsplit(bytes.into());
                 Ok(None)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Buffer was emptied by split() above; intentionally not restored
+                // on hard errors so the parser doesn't re-parse corrupt data.
+                Err(e)
+            }
         }
     }
 
@@ -302,6 +312,16 @@ fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
             .ok_or(ParseError::BadLength)?;
     }
     Ok(v)
+}
+
+/// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.
+#[inline]
+fn parse_count(buf: &[u8]) -> Result<usize, ParseError> {
+    let count = parse_usize(buf)?;
+    if count > MAX_COLLECTION_SIZE {
+        return Err(ParseError::BadLength);
+    }
+    Ok(count)
 }
 
 /// Parse an `i64` directly from ASCII bytes (optional leading `-`), no UTF-8 validation.
@@ -512,5 +532,113 @@ mod tests {
         assert!(parse_frame(Bytes::from(",3.14\r\n")).is_err()); // Double
         assert!(parse_frame(Bytes::from("#t\r\n")).is_err()); // Boolean
         assert!(parse_frame(Bytes::from("(123\r\n")).is_err()); // Big number
+    }
+
+    #[test]
+    fn integer_overflow() {
+        // One past i64::MAX
+        assert_eq!(
+            parse_frame(Bytes::from(":9223372036854775808\r\n")),
+            Err(ParseError::Overflow)
+        );
+
+        // i64::MAX should succeed
+        let (frame, _) = parse_frame(Bytes::from(":9223372036854775807\r\n")).unwrap();
+        assert_eq!(frame, Frame::Integer(i64::MAX));
+
+        // i64::MIN should succeed
+        let (frame, _) = parse_frame(Bytes::from(":-9223372036854775808\r\n")).unwrap();
+        assert_eq!(frame, Frame::Integer(i64::MIN));
+
+        // One past i64::MIN
+        assert!(parse_frame(Bytes::from(":-9223372036854775809\r\n")).is_err());
+    }
+
+    #[test]
+    fn zero_length_bulk_edge_cases() {
+        // No trailing data at all
+        assert_eq!(
+            parse_frame(Bytes::from("$0\r\n")),
+            Err(ParseError::Incomplete)
+        );
+
+        // Only one byte of trailing CRLF
+        assert_eq!(
+            parse_frame(Bytes::from("$0\r\n\r")),
+            Err(ParseError::Incomplete)
+        );
+
+        // Wrong bytes where CRLF should be
+        assert_eq!(
+            parse_frame(Bytes::from("$0\r\nXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn nonempty_bulk_malformed_terminator() {
+        // Not enough data after payload
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfoo")),
+            Err(ParseError::Incomplete)
+        );
+
+        // Only one byte after payload
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfooX")),
+            Err(ParseError::Incomplete)
+        );
+
+        // Two bytes present but wrong
+        assert_eq!(
+            parse_frame(Bytes::from("$3\r\nfooXY")),
+            Err(ParseError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn array_size_limit() {
+        // One over MAX_COLLECTION_SIZE
+        assert_eq!(
+            parse_frame(Bytes::from("*10000001\r\n")),
+            Err(ParseError::BadLength)
+        );
+
+        // At the limit should be accepted (returns Incomplete since elements are missing)
+        assert_eq!(
+            parse_frame(Bytes::from("*10000000\r\n")),
+            Err(ParseError::Incomplete)
+        );
+    }
+
+    #[test]
+    fn bulk_string_size_limit() {
+        // Over MAX_BULK_STRING_SIZE (512 MB)
+        assert_eq!(
+            parse_frame(Bytes::from("$536870913\r\n")),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn streaming_parser_clears_buffer_on_error() {
+        let mut parser = Parser::new();
+        parser.feed(Bytes::from("X\r\n"));
+        assert_eq!(parser.next_frame(), Err(ParseError::InvalidTag(b'X')));
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn streaming_parser_recovers_after_error() {
+        let mut parser = Parser::new();
+        // Feed invalid data
+        parser.feed(Bytes::from("X\r\n"));
+        assert!(parser.next_frame().is_err());
+        assert_eq!(parser.buffered_bytes(), 0);
+
+        // Feed valid data - parser should work normally
+        parser.feed(Bytes::from("+OK\r\n"));
+        let frame = parser.next_frame().unwrap().unwrap();
+        assert_eq!(frame, Frame::SimpleString(Bytes::from("OK")));
     }
 }
