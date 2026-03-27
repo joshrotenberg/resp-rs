@@ -495,3 +495,89 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unchecked parser property tests (feature = "unsafe-internals")
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "unsafe-internals")]
+proptest! {
+    /// Unchecked RESP2 parser must produce identical output to safe parser.
+    #[test]
+    fn resp2_unchecked_matches_safe(frame in arb_resp2_frame()) {
+        let wire = resp_rs::resp2::frame_to_bytes(&frame);
+        let (safe_frame, safe_rest) = resp_rs::resp2::parse_frame(wire.clone()).unwrap();
+        let (unsafe_frame, unsafe_rest) = unsafe {
+            resp_rs::resp2::parse_frame_unchecked(wire)
+        };
+        prop_assert_eq!(safe_frame, unsafe_frame);
+        prop_assert_eq!(safe_rest, unsafe_rest);
+    }
+
+    /// Unchecked RESP3 parser must produce identical output to safe parser.
+    #[test]
+    fn resp3_unchecked_matches_safe(frame in arb_resp3_frame()) {
+        let wire = resp_rs::resp3::frame_to_bytes(&frame);
+        let (safe_frame, safe_rest) = resp_rs::resp3::parse_frame(wire.clone()).unwrap();
+        let (unsafe_frame, unsafe_rest) = unsafe {
+            resp_rs::resp3::parse_frame_unchecked(wire)
+        };
+        prop_assert_eq!(safe_frame, unsafe_frame);
+        prop_assert_eq!(safe_rest, unsafe_rest);
+    }
+
+    /// Unchecked RESP2 pipeline must match safe pipeline.
+    #[test]
+    fn resp2_unchecked_pipeline(
+        frames in prop::collection::vec(arb_resp2_frame(), 1..8)
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp2::frame_to_bytes(f));
+        }
+        let mut input = Bytes::from(wire);
+        for expected in &frames {
+            let (frame, rest) = unsafe {
+                resp_rs::resp2::parse_frame_unchecked(input)
+            };
+            prop_assert_eq!(&frame, expected);
+            input = rest;
+        }
+        prop_assert!(input.is_empty());
+    }
+
+    /// Unchecked RESP3 pipeline must match safe pipeline.
+    #[test]
+    fn resp3_unchecked_pipeline(
+        frames in prop::collection::vec(arb_resp3_frame(), 1..8)
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp3::frame_to_bytes(f));
+        }
+        let mut input = Bytes::from(wire);
+        for expected in &frames {
+            let (frame, rest) = unsafe {
+                resp_rs::resp3::parse_frame_unchecked(input)
+            };
+            prop_assert_eq!(&frame, expected);
+            input = rest;
+        }
+        prop_assert!(input.is_empty());
+    }
+
+    /// Unchecked RESP3 streaming frames must match safe parser.
+    #[test]
+    fn resp3_unchecked_streaming_matches_safe(frame in arb_resp3_streaming_frame()) {
+        let wire = resp_rs::resp3::frame_to_bytes(&frame);
+
+        // parse_streaming_sequence uses parse_frame internally, but the
+        // individual frame parsing should match. Test the header + first frame.
+        let (safe_frame, safe_rest) = resp_rs::resp3::parse_frame(wire.clone()).unwrap();
+        let (unsafe_frame, unsafe_rest) = unsafe {
+            resp_rs::resp3::parse_frame_unchecked(wire)
+        };
+        prop_assert_eq!(safe_frame, unsafe_frame);
+        prop_assert_eq!(safe_rest, unsafe_rest);
+    }
+}

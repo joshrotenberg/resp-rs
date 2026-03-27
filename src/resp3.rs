@@ -588,6 +588,12 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
     }
 }
 
+#[cfg(feature = "unsafe-internals")]
+#[path = "resp3_unchecked.rs"]
+mod unchecked;
+#[cfg(feature = "unsafe-internals")]
+pub use unchecked::parse_frame_unchecked;
+
 /// Parse a complete RESP3 streaming sequence, accumulating chunks until termination.
 ///
 /// This function handles RESP3 streaming sequences that begin with streaming headers
