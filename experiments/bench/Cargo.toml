@@ -1,0 +1,17 @@
+[package]
+name = "experiments-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bench]]
+name = "three_way"
+harness = false
+
+[dependencies]
+bresp = { path = "../bresp" }
+bytes = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+prost = "0.13"
+proto-resp = { path = "../proto-resp" }
+resp-rs = { path = "../.." }

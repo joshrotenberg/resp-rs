@@ -1,0 +1,10 @@
+[package]
+name = "bresp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Experimental binary RESP protocol"
+
+[dependencies]
+bytes = "1"
+resp-rs = { path = "../.." }

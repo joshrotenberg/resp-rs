@@ -1,0 +1,14 @@
+[package]
+name = "throughput"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bresp = { path = "../bresp" }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+prost = "0.13"
+proto-resp = { path = "../proto-resp" }
+resp-rs = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
