@@ -24,6 +24,7 @@ tokio = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+futures = "0.3"
 proptest = "1"
 redis-protocol = { version = "6", features = ["resp2", "resp3", "bytes"] }
 tokio = { version = "1", features = ["full"] }
