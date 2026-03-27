@@ -90,6 +90,32 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Split a byte slice into variable-size chunks using split_points as guides.
+fn split_into_chunks(data: &[u8], split_points: &[usize]) -> Vec<Vec<u8>> {
+    if data.is_empty() {
+        return vec![vec![]];
+    }
+    let mut chunks = Vec::new();
+    let mut pos = 0;
+    for &sp in split_points {
+        if pos >= data.len() {
+            break;
+        }
+        let step = (sp % 16) + 1; // 1..=16 byte chunks
+        let end = (pos + step).min(data.len());
+        chunks.push(data[pos..end].to_vec());
+        pos = end;
+    }
+    if pos < data.len() {
+        chunks.push(data[pos..].to_vec());
+    }
+    chunks
+}
+
+// ---------------------------------------------------------------------------
 // RESP2 property tests
 // ---------------------------------------------------------------------------
 
@@ -152,6 +178,59 @@ proptest! {
         let parsed = parser.next_frame().unwrap().unwrap();
         prop_assert_eq!(&parsed, &frame);
         prop_assert!(parser.next_frame().unwrap().is_none());
+    }
+
+    /// Chunked pipeline: serialize N frames, split into arbitrary chunks,
+    /// feed chunk-by-chunk to Parser, and assert output equals original frames.
+    #[test]
+    fn resp2_chunked_pipeline(
+        frames in prop::collection::vec(arb_resp2_frame(), 1..8),
+        split_points in prop::collection::vec(0usize..256, 1..32),
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp2::frame_to_bytes(f));
+        }
+
+        let chunks = split_into_chunks(&wire, &split_points);
+
+        let mut parser = resp_rs::resp2::Parser::new();
+        let mut out = Vec::new();
+
+        for chunk in chunks {
+            parser.feed(Bytes::from(chunk));
+            while let Some(frame) = parser.next_frame().unwrap() {
+                out.push(frame);
+            }
+        }
+
+        prop_assert_eq!(&out, &frames);
+    }
+
+    /// Parser clears buffer on hard error and can recover.
+    #[test]
+    fn resp2_parser_error_clears_buffer(
+        garbage in prop::collection::vec(
+            prop::num::u8::ANY.prop_filter("not a valid tag", |b| {
+                !matches!(b, b'+' | b'-' | b':' | b'$' | b'*')
+            }),
+            1..64,
+        ),
+    ) {
+        let mut input = garbage;
+        // Ensure it ends with \r\n so the parser can find a line
+        input.extend_from_slice(b"\r\n");
+
+        let mut parser = resp_rs::resp2::Parser::new();
+        parser.feed(Bytes::from(input));
+
+        match parser.next_frame() {
+            Err(_) => {
+                prop_assert_eq!(parser.buffered_bytes(), 0);
+            }
+            Ok(None) => {} // incomplete is fine
+            Ok(Some(_)) => {} // happened to parse something
+        }
     }
 }
 
@@ -218,5 +297,59 @@ proptest! {
         let parsed = parser.next_frame().unwrap().unwrap();
         prop_assert_eq!(&parsed, &frame);
         prop_assert!(parser.next_frame().unwrap().is_none());
+    }
+
+    /// Chunked pipeline: serialize N frames, split into arbitrary chunks,
+    /// feed chunk-by-chunk to Parser, and assert output equals original frames.
+    #[test]
+    fn resp3_chunked_pipeline(
+        frames in prop::collection::vec(arb_resp3_frame(), 1..8),
+        split_points in prop::collection::vec(0usize..256, 1..32),
+    ) {
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&resp_rs::resp3::frame_to_bytes(f));
+        }
+
+        let chunks = split_into_chunks(&wire, &split_points);
+
+        let mut parser = resp_rs::resp3::Parser::new();
+        let mut out = Vec::new();
+
+        for chunk in chunks {
+            parser.feed(Bytes::from(chunk));
+            while let Some(frame) = parser.next_frame().unwrap() {
+                out.push(frame);
+            }
+        }
+
+        prop_assert_eq!(&out, &frames);
+    }
+
+    /// Parser clears buffer on hard error.
+    #[test]
+    fn resp3_parser_error_clears_buffer(
+        garbage in prop::collection::vec(
+            prop::num::u8::ANY.prop_filter("not a valid tag", |b| {
+                !matches!(b, b'+' | b'-' | b':' | b'$' | b'*' | b'_' | b',' |
+                             b'#' | b'(' | b'=' | b'!' | b'~' | b'%' | b'|' |
+                             b'>' | b';' | b'.')
+            }),
+            1..64,
+        ),
+    ) {
+        let mut input = garbage;
+        input.extend_from_slice(b"\r\n");
+
+        let mut parser = resp_rs::resp3::Parser::new();
+        parser.feed(Bytes::from(input));
+
+        match parser.next_frame() {
+            Err(_) => {
+                prop_assert_eq!(parser.buffered_bytes(), 0);
+            }
+            Ok(None) => {}
+            Ok(Some(_)) => {}
+        }
     }
 }

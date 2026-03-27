@@ -55,3 +55,24 @@ path = "fuzz_targets/fuzz_resp3_streaming.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_resp2_equivalence"
+path = "fuzz_targets/fuzz_resp2_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp3_equivalence"
+path = "fuzz_targets/fuzz_resp3_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp3_streaming_sequence"
+path = "fuzz_targets/fuzz_resp3_streaming_sequence.rs"
+test = false
+doc = false
+bench = false
