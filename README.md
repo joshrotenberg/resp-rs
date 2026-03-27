@@ -17,9 +17,12 @@ A high-performance Rust library for parsing and serializing the
 - **RESP2 and RESP3** -- full support for both protocol versions with separate frame types
 - **Streaming parser** -- handles partial reads and pipelining for incremental TCP data
 - **Serialization** -- convert frames back to wire format with `frame_to_bytes`
+- **Tokio codec** -- optional `Decoder`/`Encoder` for async TCP via `tokio_util::codec::Framed`
+- **Frame accessors** -- `as_str()`, `as_integer()`, `into_array()`, `is_null()`, and more
+- **Cluster support** -- optional CRC16 hash slot calculation with hash tag extraction
 - **High performance** -- up to 2-9x faster than `redis-protocol` (see [benchmarks](#benchmarks))
-- **Minimal dependencies** -- only `bytes` and `thiserror`
-- **No async runtime** -- pure sync parsing that works in any context
+- **`no_std` compatible** -- works in embedded/WASM with just `alloc`
+- **Minimal dependencies** -- only `bytes` and `thiserror` (both `no_std`-ready)
 
 ## Usage
 
@@ -133,7 +136,36 @@ let (frame, _) = resp3::parse_frame(data).unwrap();
 Streaming variants (chunked strings, arrays, maps, sets, attributes, pushes)
 are also fully supported.
 
+## Optional Features
+
+| Feature | Description | Dependencies |
+|---------|-------------|-------------|
+| `std` (default) | Standard library support | -- |
+| `codec` | Tokio `Decoder`/`Encoder` for async TCP | `tokio`, `tokio-util` |
+| `cluster` | CRC16 hash slot calculation | -- |
+| `unsafe-internals` | Unchecked parser for pre-validated data | -- |
+
+```toml
+# Async Redis client
+resp-rs = { version = "0.1", features = ["codec"] }
+
+# Embedded / WASM
+resp-rs = { version = "0.1", default-features = false }
+
+# Everything
+resp-rs = { version = "0.1", features = ["codec", "cluster", "unsafe-internals"] }
+```
+
 ## Examples
+
+### Async ping (Tokio codec)
+
+Connect to Redis and send a PING using the async codec:
+
+```sh
+cargo run --example ping --features codec
+cargo run --example ping --features codec -- localhost:6380
+```
 
 ### Parse demo
 
@@ -170,15 +202,15 @@ Comparative benchmarks against [`redis-protocol`](https://crates.io/crates/redis
 
 | Benchmark | resp-rs | redis-protocol | Speedup |
 |-----------|---------|----------------|---------|
-| resp2/simple_string | 11.9 ns | 21.5 ns | **1.8x** |
-| resp2/bulk_string | 12.4 ns | 26.9 ns | **2.2x** |
-| resp2/array (SET cmd) | 42.7 ns | 125.8 ns | **2.9x** |
-| resp2/array (100 elems) | 0.81 us | 3.03 us | **3.7x** |
-| resp3/simple_string | 40.4 ns | 81.8 ns | **2.0x** |
-| resp3/bulk_string | 41.3 ns | 91.0 ns | **2.2x** |
-| resp3/array (SET cmd) | 82.9 ns | 389.8 ns | **4.7x** |
-| resp3/integer (i64 max) | 48.1 ns | 85.8 ns | **1.8x** |
-| resp3/array (100 elems) | 1.09 us | 9.38 us | **8.6x** |
+| resp2/simple_string | 12.6 ns | 20.8 ns | **1.7x** |
+| resp2/bulk_string | 12.9 ns | 26.4 ns | **2.0x** |
+| resp2/array (SET cmd) | 43.7 ns | 124.9 ns | **2.9x** |
+| resp2/array (100 elems) | 828 ns | 3.08 us | **3.7x** |
+| resp3/simple_string | 39.1 ns | 81.0 ns | **2.1x** |
+| resp3/bulk_string | 41.5 ns | 90.8 ns | **2.2x** |
+| resp3/array (SET cmd) | 83.9 ns | 366.8 ns | **4.4x** |
+| resp3/integer (i64 max) | 48.1 ns | 94.3 ns | **2.0x** |
+| resp3/array (100 elems) | 1.13 us | 9.76 us | **8.6x** |
 
 Run the full benchmark suite:
 
