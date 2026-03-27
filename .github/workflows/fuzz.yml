@@ -1,0 +1,40 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Run nightly at 04:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_resp2_parse
+          - fuzz_resp3_parse
+          - fuzz_resp2_roundtrip
+          - fuzz_resp3_roundtrip
+          - fuzz_resp2_streaming
+          - fuzz_resp3_streaming
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz
+      - name: Run fuzzer for 5 minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/

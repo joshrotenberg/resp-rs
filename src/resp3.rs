@@ -294,7 +294,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 }
             }
             let data_start = after_crlf;
-            let data_end = data_start + len;
+            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
             if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
@@ -323,6 +323,18 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             // numeric double
             let s = std::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
             let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
+            // Rust's f64::parse accepts case-insensitive "inf"/"infinity"/"nan".
+            // Normalize these to SpecialFloat for consistent roundtripping.
+            if v.is_infinite() || v.is_nan() {
+                let canonical = if v.is_nan() {
+                    "nan"
+                } else if v.is_sign_negative() {
+                    "-inf"
+                } else {
+                    "inf"
+                };
+                return Ok((Frame::SpecialFloat(Bytes::from(canonical)), after_crlf));
+            }
             Ok((Frame::Double(v), after_crlf))
         }
         b'#' => {
@@ -353,7 +365,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             }
             let len = parse_usize(len_bytes)?;
             let data_start = after_crlf;
-            let data_end = data_start + len;
+            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
             if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
@@ -378,7 +390,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             }
             let len = parse_usize(len_bytes)?;
             let data_start = after_crlf;
-            let data_end = data_start + len;
+            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
             if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
@@ -480,7 +492,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 }
             }
             let data_start = after_crlf;
-            let data_end = data_start + len;
+            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
             if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
