@@ -11,6 +11,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::ParseError;
 
+/// Maximum reasonable size for collections to prevent DoS attacks.
+const MAX_COLLECTION_SIZE: usize = 10_000_000;
+
 /// A parsed RESP2 frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
@@ -96,7 +99,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 }
             }
             let data_start = after_crlf;
-            let data_end = data_start + len;
+            let data_end = data_start.checked_add(len).ok_or(ParseError::BadLength)?;
             if data_end + 1 >= buf.len() || buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
                 return Err(ParseError::Incomplete);
             }
@@ -113,6 +116,9 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 return Ok((Frame::Array(None), after_crlf));
             }
             let count = parse_usize(len_bytes)?;
+            if count > MAX_COLLECTION_SIZE {
+                return Err(ParseError::BadLength);
+            }
             if count == 0 {
                 return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
