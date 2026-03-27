@@ -368,12 +368,8 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
             if len_bytes == b"?" {
                 return Ok((Frame::StreamedVerbatimStringHeader, after_crlf));
             }
-            // null case
             if len_bytes == b"-1" {
-                return Ok((
-                    Frame::VerbatimString(Bytes::new(), Bytes::new()),
-                    after_crlf,
-                ));
+                return Err(ParseError::BadLength);
             }
             let len = parse_usize(len_bytes)?;
             if len > MAX_BULK_STRING_SIZE {
@@ -392,6 +388,9 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 .iter()
                 .position(|&b| b == b':')
                 .ok_or(ParseError::InvalidFormat)?;
+            if sep != 3 {
+                return Err(ParseError::InvalidFormat);
+            }
             let format = input.slice(data_start..data_start + sep);
             let content = input.slice(data_start + sep + 1..data_end);
             Ok((Frame::VerbatimString(format, content), data_end + 2))
@@ -404,7 +403,7 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
                 return Ok((Frame::StreamedBlobErrorHeader, after_crlf));
             }
             if len_bytes == b"-1" {
-                return Ok((Frame::BlobError(Bytes::new()), after_crlf));
+                return Err(ParseError::BadLength);
             }
             let len = parse_usize(len_bytes)?;
             if len > MAX_BULK_STRING_SIZE {
@@ -1486,15 +1485,38 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_frame_null_bulk_and_error() {
-        let input1 = Bytes::from("!-1\r\nTAIL");
-        let (f1, r1) = parse_frame(input1.clone()).unwrap();
-        assert_eq!(f1, Frame::BlobError(Bytes::new()));
-        assert_eq!(r1, Bytes::from("TAIL"));
-        let input2 = Bytes::from("=-1\r\nTAIL");
-        let (f2, r2) = parse_frame(input2.clone()).unwrap();
-        assert_eq!(f2, Frame::VerbatimString(Bytes::new(), Bytes::new()));
-        assert_eq!(r2, Bytes::from("TAIL"));
+    fn test_parse_frame_null_blob_error_rejected() {
+        let input = Bytes::from("!-1\r\nTAIL");
+        assert_eq!(parse_frame(input), Err(ParseError::BadLength));
+    }
+
+    #[test]
+    fn test_parse_frame_null_verbatim_rejected() {
+        let input = Bytes::from("=-1\r\nTAIL");
+        assert_eq!(parse_frame(input), Err(ParseError::BadLength));
+    }
+
+    #[test]
+    fn test_verbatim_string_format_must_be_3_bytes() {
+        // Too short (1 byte format)
+        let input = Bytes::from("=6\r\nx:data\r\n");
+        assert_eq!(parse_frame(input), Err(ParseError::InvalidFormat));
+
+        // Too long (4 byte format)
+        let input = Bytes::from("=9\r\ntxtx:data\r\n");
+        assert_eq!(parse_frame(input), Err(ParseError::InvalidFormat));
+
+        // Empty format (colon at start)
+        let input = Bytes::from("=5\r\n:data\r\n");
+        assert_eq!(parse_frame(input), Err(ParseError::InvalidFormat));
+
+        // Valid 3-byte format should still work
+        let input = Bytes::from("=8\r\ntxt:data\r\n");
+        let (frame, _) = parse_frame(input).unwrap();
+        assert_eq!(
+            frame,
+            Frame::VerbatimString(Bytes::from("txt"), Bytes::from("data"))
+        );
     }
 
     #[test]
