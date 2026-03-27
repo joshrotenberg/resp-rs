@@ -46,6 +46,73 @@ pub enum Frame {
     Array(Option<Vec<Frame>>),
 }
 
+impl Frame {
+    /// Returns the bytes if this is a `SimpleString`, `Error`, or `BulkString`.
+    ///
+    /// For `BulkString(None)` (null), returns `None`.
+    pub fn as_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Frame::SimpleString(b) | Frame::Error(b) => Some(b),
+            Frame::BulkString(opt) => opt.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the string data as a UTF-8 `&str`, if this is a string-like frame
+    /// and contains valid UTF-8.
+    pub fn as_str(&self) -> Option<&str> {
+        self.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
+    }
+
+    /// Returns the integer value if this is an `Integer` frame.
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Frame::Integer(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the array items if this is an `Array`.
+    ///
+    /// For `Array(None)` (null), returns `None`.
+    pub fn as_array(&self) -> Option<&[Frame]> {
+        match self {
+            Frame::Array(Some(items)) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Consumes the frame and returns the array items.
+    ///
+    /// Returns `Err(self)` if this is not a non-null `Array`.
+    pub fn into_array(self) -> Result<Vec<Frame>, Frame> {
+        match self {
+            Frame::Array(Some(items)) => Ok(items),
+            other => Err(other),
+        }
+    }
+
+    /// Consumes the frame and returns the bulk string bytes.
+    ///
+    /// Returns `Err(self)` if this is not a non-null `BulkString`.
+    pub fn into_bulk_string(self) -> Result<Bytes, Frame> {
+        match self {
+            Frame::BulkString(Some(b)) => Ok(b),
+            other => Err(other),
+        }
+    }
+
+    /// Returns `true` if this is a null bulk string or null array.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Frame::BulkString(None) | Frame::Array(None))
+    }
+
+    /// Returns `true` if this is an `Error` frame.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Frame::Error(_))
+    }
+}
+
 /// Parse a single RESP2 frame from the provided bytes.
 ///
 /// Returns the parsed frame and any remaining unconsumed bytes.
@@ -666,5 +733,76 @@ mod tests {
         parser.feed(Bytes::from("+OK\r\n"));
         let frame = parser.next_frame().unwrap().unwrap();
         assert_eq!(frame, Frame::SimpleString(Bytes::from("OK")));
+    }
+
+    #[test]
+    fn frame_as_bytes() {
+        assert_eq!(
+            Frame::SimpleString(Bytes::from("OK")).as_bytes(),
+            Some(&Bytes::from("OK"))
+        );
+        assert_eq!(
+            Frame::Error(Bytes::from("ERR")).as_bytes(),
+            Some(&Bytes::from("ERR"))
+        );
+        assert_eq!(
+            Frame::BulkString(Some(Bytes::from("data"))).as_bytes(),
+            Some(&Bytes::from("data"))
+        );
+        assert_eq!(Frame::BulkString(None).as_bytes(), None);
+        assert_eq!(Frame::Integer(42).as_bytes(), None);
+    }
+
+    #[test]
+    fn frame_as_str() {
+        assert_eq!(Frame::SimpleString(Bytes::from("OK")).as_str(), Some("OK"));
+        // Invalid UTF-8
+        assert_eq!(
+            Frame::BulkString(Some(Bytes::from_static(&[0xFF]))).as_str(),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_as_integer() {
+        assert_eq!(Frame::Integer(42).as_integer(), Some(42));
+        assert_eq!(Frame::SimpleString(Bytes::from("42")).as_integer(), None);
+    }
+
+    #[test]
+    fn frame_as_array() {
+        let arr = Frame::Array(Some(vec![Frame::Integer(1)]));
+        assert_eq!(arr.as_array(), Some([Frame::Integer(1)].as_slice()));
+        assert_eq!(Frame::Array(None).as_array(), None);
+        assert_eq!(Frame::Integer(1).as_array(), None);
+    }
+
+    #[test]
+    fn frame_into_array() {
+        let arr = Frame::Array(Some(vec![Frame::Integer(1)]));
+        assert_eq!(arr.into_array(), Ok(vec![Frame::Integer(1)]));
+        assert!(Frame::Array(None).into_array().is_err());
+        assert!(Frame::Integer(1).into_array().is_err());
+    }
+
+    #[test]
+    fn frame_into_bulk_string() {
+        let bs = Frame::BulkString(Some(Bytes::from("data")));
+        assert_eq!(bs.into_bulk_string(), Ok(Bytes::from("data")));
+        assert!(Frame::BulkString(None).into_bulk_string().is_err());
+    }
+
+    #[test]
+    fn frame_is_null() {
+        assert!(Frame::BulkString(None).is_null());
+        assert!(Frame::Array(None).is_null());
+        assert!(!Frame::BulkString(Some(Bytes::new())).is_null());
+        assert!(!Frame::Integer(0).is_null());
+    }
+
+    #[test]
+    fn frame_is_error() {
+        assert!(Frame::Error(Bytes::from("ERR")).is_error());
+        assert!(!Frame::SimpleString(Bytes::from("OK")).is_error());
     }
 }
