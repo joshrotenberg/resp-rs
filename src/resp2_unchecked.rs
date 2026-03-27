@@ -129,7 +129,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             (Frame::Array(Some(items)), cursor)
         }
         // SAFETY: caller guarantees valid RESP2, so tag must be one of the above
-        _ => std::hint::unreachable_unchecked(),
+        _ => core::hint::unreachable_unchecked(),
     }
 }
 

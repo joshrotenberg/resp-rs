@@ -88,7 +88,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             if line == b"inf" || line == b"-inf" || line == b"nan" {
                 return (Frame::SpecialFloat(input.slice(pos + 1..cr)), cr + 2);
             }
-            let s = std::str::from_utf8_unchecked(line);
+            let s = core::str::from_utf8_unchecked(line);
             let v: f64 = s.parse().unwrap_unchecked();
             (Frame::Double(v), cr + 2)
         }
@@ -217,7 +217,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             (Frame::StreamedStringChunk(input.slice(ds..de)), de + 2)
         }
         b'.' => (Frame::StreamTerminator, pos + 3),
-        _ => std::hint::unreachable_unchecked(),
+        _ => core::hint::unreachable_unchecked(),
     }
 }
 

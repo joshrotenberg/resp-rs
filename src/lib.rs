@@ -295,6 +295,20 @@
 //! Implements CRC16-CCITT with hash tag extraction per the
 //! [Redis Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#hash-tags).
 //!
+//! # `no_std` Support
+//!
+//! This crate supports `no_std` environments (with `alloc`). The `std` feature
+//! is enabled by default; disable it for embedded or WASM targets:
+//!
+//! ```toml
+//! [dependencies]
+//! resp-rs = { version = "0.1", default-features = false }
+//! ```
+//!
+//! All core parsing and serialization works without `std`. The `codec` feature
+//! requires `std` (Tokio dependency). The `cluster` and `unsafe-internals`
+//! features work in `no_std`.
+//!
 //! # Performance
 //!
 //! The parser uses offset-based internal parsing to minimize allocations. Bulk string
@@ -375,6 +389,10 @@
 //! // Empty input
 //! assert_eq!(resp2::parse_frame(Bytes::new()), Err(ParseError::Incomplete));
 //! ```
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod resp2;
 pub mod resp3;
