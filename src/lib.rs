@@ -200,7 +200,7 @@
 //!
 //! # Tokio Codec (async)
 //!
-//! Enable the `codec` feature for [`tokio_util::codec`] integration:
+//! Enable the `codec` feature for `tokio_util::codec` integration:
 //!
 //! ```toml
 //! [dependencies]
@@ -210,9 +210,9 @@
 //! futures = "0.3"  # for SinkExt / StreamExt
 //! ```
 //!
-//! This provides [`resp2::Codec`] and [`resp3::Codec`], which implement
-//! [`tokio_util::codec::Decoder`] and [`tokio_util::codec::Encoder`].
-//! Wrap a TCP stream with [`tokio_util::codec::Framed`] for async
+//! This provides `resp2::Codec` and `resp3::Codec`, which implement
+//! `tokio_util::codec::Decoder` and `tokio_util::codec::Encoder`.
+//! Wrap a TCP stream with `tokio_util::codec::Framed` for async
 //! frame-level I/O:
 //!
 //! ```ignore
@@ -237,8 +237,8 @@
 //! ```
 //!
 //! The decoder uses the same zero-copy [`parse_frame`](resp2::parse_frame) path
-//! internally. Errors are returned as [`codec::CodecError`], which wraps both
-//! [`ParseError`] and [`std::io::Error`].
+//! internally. Errors are returned as `codec::CodecError`, which wraps both
+//! [`ParseError`] and `std::io::Error`.
 //!
 //! # Performance
 //!
