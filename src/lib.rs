@@ -203,7 +203,11 @@
 //! Enable the `codec` feature for [`tokio_util::codec`] integration:
 //!
 //! ```toml
+//! [dependencies]
 //! resp-rs = { version = "0.1", features = ["codec"] }
+//! tokio = { version = "1", features = ["net"] }
+//! tokio-util = { version = "0.7", features = ["codec"] }
+//! futures = "0.3"  # for SinkExt / StreamExt
 //! ```
 //!
 //! This provides [`resp2::Codec`] and [`resp3::Codec`], which implement
