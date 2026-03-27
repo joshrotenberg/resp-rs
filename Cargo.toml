@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "unsafe_experiment"
 harness = false
+
+[[example]]
+name = "ping"
+required-features = ["codec"]
