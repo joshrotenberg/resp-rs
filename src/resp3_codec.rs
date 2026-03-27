@@ -123,10 +123,7 @@ mod tests {
 
         // Double
         let mut buf = BytesMut::from(",3.5\r\n");
-        assert_eq!(
-            codec.decode(&mut buf).unwrap().unwrap(),
-            Frame::Double(3.5)
-        );
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), Frame::Double(3.5));
 
         // Map
         let mut buf = BytesMut::from("%1\r\n+key\r\n:1\r\n");
