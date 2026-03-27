@@ -21,6 +21,9 @@
 //! This is intentional for zero-copy operation and compatibility with
 //! servers that may send non-UTF-8 data in these fields.
 
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::ParseError;
@@ -61,7 +64,7 @@ impl Frame {
     /// Returns the string data as a UTF-8 `&str`, if this is a string-like frame
     /// and contains valid UTF-8.
     pub fn as_str(&self) -> Option<&str> {
-        self.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
+        self.as_bytes().and_then(|b| core::str::from_utf8(b).ok())
     }
 
     /// Returns the integer value if this is an `Integer` frame.

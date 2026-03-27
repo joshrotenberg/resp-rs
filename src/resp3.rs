@@ -25,6 +25,9 @@
 //!   a chunk format for these types. Use low-level `parse_frame` to handle
 //!   these headers manually if needed.
 
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Maximum reasonable size for collections to prevent DoS attacks.
@@ -281,7 +284,7 @@ impl Frame {
     /// Returns the string data as a UTF-8 `&str`, if this is a string-like frame
     /// and contains valid UTF-8.
     pub fn as_str(&self) -> Option<&str> {
-        self.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
+        self.as_bytes().and_then(|b| core::str::from_utf8(b).ok())
     }
 
     /// Returns the integer value if this is an `Integer` frame.
@@ -479,7 +482,7 @@ fn parse_double_frame(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, u
             after_crlf,
         ));
     }
-    let s = std::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
+    let s = core::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
     let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
     if v.is_infinite() || v.is_nan() {
         let canonical = if v.is_nan() {
@@ -770,7 +773,7 @@ pub use codec_impl::Codec;
 /// if let Frame::StreamedString(chunks) = frame {
 ///     assert_eq!(chunks.len(), 3);
 ///     let full_string: String = chunks.iter()
-///         .map(|chunk| std::str::from_utf8(chunk).unwrap())
+///         .map(|chunk| core::str::from_utf8(chunk).unwrap())
 ///         .collect::<Vec<_>>()
 ///         .join("");
 ///     assert_eq!(full_string, "Hello world");
