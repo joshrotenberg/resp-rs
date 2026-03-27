@@ -6,6 +6,13 @@
 //! - Integer: `:42\r\n`
 //! - Bulk String: `$6\r\nfoobar\r\n` (or `$-1\r\n` for null)
 //! - Array: `*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n` (or `*-1\r\n` for null)
+//!
+//! # Protocol permissiveness
+//!
+//! Simple strings and errors are treated as raw bytes, not validated UTF-8.
+//! The parser accepts any byte sequence that does not contain `\r` or `\n`.
+//! This is intentional for zero-copy operation and compatibility with
+//! servers that may send non-UTF-8 data in these fields.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
