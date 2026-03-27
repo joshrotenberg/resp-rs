@@ -282,6 +282,9 @@
 pub mod resp2;
 pub mod resp3;
 
+#[cfg(feature = "codec")]
+pub mod codec;
+
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ParseError {

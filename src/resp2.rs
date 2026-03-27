@@ -72,7 +72,7 @@ pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
 
 /// Offset-based internal parser. Works with byte positions to avoid creating
 /// intermediate `Bytes::slice()` objects. Only slices for actual frame data.
-fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
+pub(crate) fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
     let buf = input.as_ref();
     if pos >= buf.len() {
         return Err(ParseError::Incomplete);
@@ -160,6 +160,12 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
 mod unchecked;
 #[cfg(feature = "unsafe-internals")]
 pub use unchecked::parse_frame_unchecked;
+
+#[cfg(feature = "codec")]
+#[path = "resp2_codec.rs"]
+mod codec_impl;
+#[cfg(feature = "codec")]
+pub use codec_impl::Codec;
 
 /// Serialize a RESP2 frame to bytes.
 ///
