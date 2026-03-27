@@ -132,30 +132,25 @@ async fn read_one_frame(
         if !buf.is_empty() {
             let frozen = buf.clone().freeze();
             let consumed = match format {
-                Format::Resp3 => {
-                    match resp_rs::resp3::parse_frame(frozen) {
-                        Ok((_, rest)) => Some(buf.len() - rest.len()),
-                        Err(resp_rs::ParseError::Incomplete) => None,
-                        Err(_) => return Ok(false),
-                    }
-                }
-                Format::Bresp => {
-                    match bresp::parse_frame(frozen) {
-                        Ok((_, rest)) => Some(buf.len() - rest.len()),
-                        Err(bresp::ParseError::Incomplete) => None,
-                        Err(_) => return Ok(false),
-                    }
-                }
+                Format::Resp3 => match resp_rs::resp3::parse_frame(frozen) {
+                    Ok((_, rest)) => Some(buf.len() - rest.len()),
+                    Err(resp_rs::ParseError::Incomplete) => None,
+                    Err(_) => return Ok(false),
+                },
+                Format::Bresp => match bresp::parse_frame(frozen) {
+                    Ok((_, rest)) => Some(buf.len() - rest.len()),
+                    Err(bresp::ParseError::Incomplete) => None,
+                    Err(_) => return Ok(false),
+                },
                 Format::Proto => {
                     // Length-prefixed: 4-byte u32 + message
                     if buf.len() < 4 {
                         None
                     } else {
-                        let len =
-                            u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+                        let len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
                         if buf.len() >= 4 + len {
-                            let _ = proto_resp::pb::Frame::decode(&buf[4..4 + len])
-                                .map_err(|e| {
+                            let _ =
+                                proto_resp::pb::Frame::decode(&buf[4..4 + len]).map_err(|e| {
                                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                                 })?;
                             Some(4 + len)
@@ -240,7 +235,11 @@ async fn run_client(addr: &str, format: Format, num: usize) -> std::io::Result<(
     println!("  Total time:    {elapsed:.2?}");
     println!("  Throughput:    {rps:.0} req/s");
     println!("  Latency:       {us_per_req:.1} us/req");
-    println!("  Wire size:     {} bytes/req, {} bytes/resp", request.len(), encode_response(format).len());
+    println!(
+        "  Wire size:     {} bytes/req, {} bytes/resp",
+        request.len(),
+        encode_response(format).len()
+    );
 
     Ok(())
 }
