@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package resp;
+
+// A RESP frame modeled as a protobuf message.
+// Covers all RESP2 and RESP3 types.
+message Frame {
+  oneof kind {
+    bytes simple_string = 1;
+    bytes error = 2;
+    int64 integer = 3;
+    NullableBytes bulk_string = 4;
+    Null null = 5;
+    double double_val = 6;
+    bool boolean = 7;
+    bytes big_number = 8;
+    bytes blob_error = 9;
+    VerbatimString verbatim_string = 10;
+    NullableArray array = 11;
+    FrameList set = 12;
+    PairList map = 13;
+    PairList attribute = 14;
+    FrameList push = 15;
+  }
+}
+
+// Null type (RESP3 _\r\n)
+message Null {}
+
+// Bulk string that can be null ($-1)
+message NullableBytes {
+  optional bytes data = 1;
+}
+
+// Array that can be null (*-1)
+message NullableArray {
+  optional FrameList items = 1;
+}
+
+// List of frames (for Array, Set, Push)
+message FrameList {
+  repeated Frame items = 1;
+}
+
+// Key-value pair
+message Pair {
+  Frame key = 1;
+  Frame value = 2;
+}
+
+// List of key-value pairs (for Map, Attribute)
+message PairList {
+  repeated Pair entries = 1;
+}
+
+// Verbatim string with format tag
+message VerbatimString {
+  bytes format = 1;
+  bytes content = 2;
+}

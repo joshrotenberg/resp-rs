@@ -1,0 +1,14 @@
+[package]
+name = "proto-resp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Experimental protobuf-encoded RESP protocol"
+
+[dependencies]
+bytes = "1"
+prost = "0.13"
+resp-rs = { path = "../.." }
+
+[build-dependencies]
+prost-build = "0.13"
