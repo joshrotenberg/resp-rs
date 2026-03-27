@@ -1,0 +1,57 @@
+[package]
+name = "resp-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.resp-rs]
+path = ".."
+
+[[bin]]
+name = "fuzz_resp2_parse"
+path = "fuzz_targets/fuzz_resp2_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp3_parse"
+path = "fuzz_targets/fuzz_resp3_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp2_roundtrip"
+path = "fuzz_targets/fuzz_resp2_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp3_roundtrip"
+path = "fuzz_targets/fuzz_resp3_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp2_streaming"
+path = "fuzz_targets/fuzz_resp2_streaming.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp3_streaming"
+path = "fuzz_targets/fuzz_resp3_streaming.rs"
+test = false
+doc = false
+bench = false
