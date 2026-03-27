@@ -14,15 +14,20 @@ rust-version = "1.85"
 
 [features]
 unsafe-internals = []
+codec = ["dep:tokio-util", "dep:tokio"]
 
 [dependencies]
 bytes = "1"
 thiserror = "2"
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tokio = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+futures = "0.3"
 proptest = "1"
 redis-protocol = { version = "6", features = ["resp2", "resp3", "bytes"] }
+tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "parsing"
@@ -35,3 +40,7 @@ harness = false
 [[bench]]
 name = "unsafe_experiment"
 harness = false
+
+[[example]]
+name = "ping"
+required-features = ["codec"]

@@ -520,7 +520,7 @@ fn parse_streamed_chunk(
 /// Offset-based internal parser. The match body is kept minimal to reduce
 /// instruction-cache pressure; heavy arms are extracted into `#[inline(never)]`
 /// helpers so the hot dispatch stays small.
-fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
+pub(crate) fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
     let buf = input.as_ref();
     if pos >= buf.len() {
         return Err(ParseError::Incomplete);
@@ -593,6 +593,12 @@ fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseE
 mod unchecked;
 #[cfg(feature = "unsafe-internals")]
 pub use unchecked::parse_frame_unchecked;
+
+#[cfg(feature = "codec")]
+#[path = "resp3_codec.rs"]
+mod codec_impl;
+#[cfg(feature = "codec")]
+pub use codec_impl::Codec;
 
 /// Parse a complete RESP3 streaming sequence, accumulating chunks until termination.
 ///

@@ -198,6 +198,48 @@
 //! }
 //! ```
 //!
+//! # Tokio Codec (async)
+//!
+//! Enable the `codec` feature for `tokio_util::codec` integration:
+//!
+//! ```toml
+//! [dependencies]
+//! resp-rs = { version = "0.1", features = ["codec"] }
+//! tokio = { version = "1", features = ["net"] }
+//! tokio-util = { version = "0.7", features = ["codec"] }
+//! futures = "0.3"  # for SinkExt / StreamExt
+//! ```
+//!
+//! This provides `resp2::Codec` and `resp3::Codec`, which implement
+//! `tokio_util::codec::Decoder` and `tokio_util::codec::Encoder`.
+//! Wrap a TCP stream with `tokio_util::codec::Framed` for async
+//! frame-level I/O:
+//!
+//! ```ignore
+//! use resp_rs::resp2::{Codec, Frame};
+//! use tokio::net::TcpStream;
+//! use tokio_util::codec::Framed;
+//! use futures::{SinkExt, StreamExt};
+//! use bytes::Bytes;
+//!
+//! let stream = TcpStream::connect("127.0.0.1:6379").await?;
+//! let mut framed = Framed::new(stream, Codec::new());
+//!
+//! // Send a PING
+//! framed.send(Frame::Array(Some(vec![
+//!     Frame::BulkString(Some(Bytes::from("PING"))),
+//! ]))).await?;
+//!
+//! // Read the response
+//! if let Some(Ok(frame)) = framed.next().await {
+//!     println!("{frame:?}"); // SimpleString("PONG")
+//! }
+//! ```
+//!
+//! The decoder uses the same zero-copy [`parse_frame`](resp2::parse_frame) path
+//! internally. Errors are returned as `codec::CodecError`, which wraps both
+//! [`ParseError`] and `std::io::Error`.
+//!
 //! # Performance
 //!
 //! The parser uses offset-based internal parsing to minimize allocations. Bulk string
@@ -281,6 +323,9 @@
 
 pub mod resp2;
 pub mod resp3;
+
+#[cfg(feature = "codec")]
+pub mod codec;
 
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
