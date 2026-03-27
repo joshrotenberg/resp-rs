@@ -363,6 +363,9 @@ pub mod resp3;
 #[cfg(feature = "codec")]
 pub mod codec;
 
+#[cfg(feature = "cluster")]
+pub mod cluster;
+
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ParseError {
