@@ -1,0 +1,3 @@
+# Seed corpus files contain raw RESP protocol data with literal \r\n bytes.
+# Prevent git from normalizing line endings.
+*.bin binary
