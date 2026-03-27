@@ -18,12 +18,17 @@ std = ["thiserror/std", "bytes/std"]
 unsafe-internals = []
 codec = ["std", "dep:tokio-util", "dep:tokio"]
 cluster = []
+proto = ["dep:prost"]
 
 [dependencies]
 bytes = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tokio = { version = "1", optional = true }
+prost = { version = "0.13", optional = true }
+
+[build-dependencies]
+prost-build = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -43,6 +48,11 @@ harness = false
 [[bench]]
 name = "unsafe_experiment"
 harness = false
+
+[[bench]]
+name = "bresp_comparison"
+harness = false
+required-features = ["proto"]
 
 [[example]]
 name = "ping"

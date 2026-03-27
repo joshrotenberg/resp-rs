@@ -403,6 +403,11 @@ pub mod codec;
 #[cfg(feature = "cluster")]
 pub mod cluster;
 
+pub mod bresp;
+
+#[cfg(feature = "proto")]
+pub mod proto_resp;
+
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ParseError {
