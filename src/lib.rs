@@ -198,6 +198,67 @@
 //! }
 //! ```
 //!
+//! # Performance
+//!
+//! The parser uses offset-based internal parsing to minimize allocations. Bulk string
+//! parsing is an O(1) slice into the input buffer, not a copy.
+//!
+//! ## `parse_frame` vs `Parser`
+//!
+//! [`resp2::parse_frame`] and [`resp3::parse_frame`] parse directly from a [`bytes::Bytes`]
+//! buffer with no overhead. The [`resp2::Parser`] and [`resp3::Parser`] wrappers add
+//! incremental buffering for TCP streams, but have roughly 2x overhead per frame due to
+//! internal `BytesMut` split/unsplit operations.
+//!
+//! **If you already have a complete buffer** (e.g., a full response read from a socket),
+//! call `parse_frame` directly in a loop rather than going through `Parser`:
+//!
+//! ```
+//! use bytes::Bytes;
+//! use resp_rs::resp2;
+//!
+//! let wire = Bytes::from("+OK\r\n:42\r\n$5\r\nhello\r\n");
+//! let mut input = wire;
+//! while !input.is_empty() {
+//!     match resp2::parse_frame(input) {
+//!         Ok((frame, rest)) => {
+//!             // process frame
+//!             input = rest;
+//!         }
+//!         Err(resp_rs::ParseError::Incomplete) => break, // need more data
+//!         Err(e) => panic!("parse error: {e}"),
+//!     }
+//! }
+//! ```
+//!
+//! **Use `Parser` when** data arrives incrementally (e.g., reading from a TCP socket in
+//! chunks) and you need to buffer partial frames across reads.
+//!
+//! ## RESP2 vs RESP3
+//!
+//! RESP2 parsing is roughly 3x faster than RESP3 for simple types due to RESP2's smaller
+//! type tag match (5 variants vs 16+). The gap narrows for collection-heavy workloads
+//! where per-element parsing dominates. If your application only needs RESP2, prefer the
+//! [`resp2`] module for best performance.
+//!
+//! ## Representative timings
+//!
+//! Measured on Apple M4 (single core, criterion):
+//!
+//! | Operation | RESP2 | RESP3 |
+//! |-----------|-------|-------|
+//! | Simple string | 12 ns | 39 ns |
+//! | Bulk string | 13 ns | 39 ns |
+//! | Integer | 25 ns | 47 ns |
+//! | 3-element array | 43 ns | 82 ns |
+//! | 100-element array | 822 ns | 2.0 us |
+//! | 5-frame pipeline (direct) | 107 ns | 129 ns |
+//! | 5-frame pipeline (Parser) | 242 ns | 286 ns |
+//! | Streaming string (2 chunks) | -- | 124 ns |
+//! | Streaming array (5 elements) | -- | 226 ns |
+//!
+//! Run `cargo bench` to reproduce on your hardware.
+//!
 //! # Error Handling
 //!
 //! All parsing functions return [`Result<_, ParseError>`]. The [`ParseError::Incomplete`]

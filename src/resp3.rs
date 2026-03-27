@@ -3,6 +3,13 @@
 //! Parses RESP3 frames using `bytes::Bytes` for efficient, zero-copy operation.
 //! Supports all RESP3 data types, including fixed-length and streaming variants.
 //!
+//! # Performance
+//!
+//! RESP3 parsing is roughly 3x slower than RESP2 for simple types due to the
+//! larger type tag match. The gap narrows for collection-heavy workloads. For
+//! complete buffers, call [`parse_frame`] directly rather than using [`Parser`]
+//! (see [crate-level performance docs](crate#performance)).
+//!
 //! # Protocol permissiveness
 //!
 //! - **Simple strings and errors** are treated as raw bytes, not validated UTF-8.

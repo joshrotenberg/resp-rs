@@ -7,6 +7,13 @@
 //! - Bulk String: `$6\r\nfoobar\r\n` (or `$-1\r\n` for null)
 //! - Array: `*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n` (or `*-1\r\n` for null)
 //!
+//! # Performance
+//!
+//! For complete buffers, call [`parse_frame`] directly in a loop rather than
+//! using [`Parser`]. The `Parser` wrapper adds ~2x overhead per frame for its
+//! incremental buffering. See the [crate-level performance docs](crate#performance)
+//! for details and representative timings.
+//!
 //! # Protocol permissiveness
 //!
 //! Simple strings and errors are treated as raw bytes, not validated UTF-8.
