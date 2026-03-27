@@ -2,6 +2,21 @@
 //!
 //! Parses RESP3 frames using `bytes::Bytes` for efficient, zero-copy operation.
 //! Supports all RESP3 data types, including fixed-length and streaming variants.
+//!
+//! # Protocol permissiveness
+//!
+//! - **Simple strings and errors** are treated as raw bytes, not validated UTF-8.
+//!   The parser accepts any byte sequence that does not contain `\r` or `\n`.
+//! - **Double parsing** accepts case-insensitive and non-canonical float spellings
+//!   (e.g., `INF`, `Infinity`, `NAN`) via Rust's `f64::parse`, then normalizes
+//!   them to canonical [`Frame::SpecialFloat`] values (`inf`, `-inf`, `nan`).
+//!   This means roundtrip is semantic (value-preserving) but not lexical
+//!   (byte-preserving) for non-canonical inputs.
+//! - **Streaming support** for blob errors and verbatim strings is limited:
+//!   `parse_streaming_sequence` passes through their streaming headers
+//!   (`!?\r\n`, `=?\r\n`) without accumulation, since RESP3 does not define
+//!   a chunk format for these types. Use low-level `parse_frame` to handle
+//!   these headers manually if needed.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
