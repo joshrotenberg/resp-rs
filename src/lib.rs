@@ -276,6 +276,25 @@
 //! | `is_null()` | `bool` | Any frame |
 //! | `is_error()` | `bool` | Any frame |
 //!
+//! # Redis Cluster (hash slots)
+//!
+//! Enable the `cluster` feature for hash slot calculation:
+//!
+//! ```toml
+//! [dependencies]
+//! resp-rs = { version = "0.1", features = ["cluster"] }
+//! ```
+//!
+//! ```ignore
+//! use resp_rs::cluster::hash_slot;
+//!
+//! // Keys with the same hash tag route to the same slot
+//! assert_eq!(hash_slot(b"{user}.name"), hash_slot(b"{user}.email"));
+//! ```
+//!
+//! Implements CRC16-CCITT with hash tag extraction per the
+//! [Redis Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#hash-tags).
+//!
 //! # Performance
 //!
 //! The parser uses offset-based internal parsing to minimize allocations. Bulk string
@@ -362,6 +381,9 @@ pub mod resp3;
 
 #[cfg(feature = "codec")]
 pub mod codec;
+
+#[cfg(feature = "cluster")]
+pub mod cluster;
 
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

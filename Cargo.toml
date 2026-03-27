@@ -15,6 +15,7 @@ rust-version = "1.85"
 [features]
 unsafe-internals = []
 codec = ["dep:tokio-util", "dep:tokio"]
+cluster = []
 
 [dependencies]
 bytes = "1"
