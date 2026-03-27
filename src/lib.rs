@@ -240,6 +240,42 @@
 //! internally. Errors are returned as `codec::CodecError`, which wraps both
 //! [`ParseError`] and `std::io::Error`.
 //!
+//! # Working with Frames
+//!
+//! Both [`resp2::Frame`] and [`resp3::Frame`] provide convenience methods for
+//! extracting typed data without manual pattern matching:
+//!
+//! ```
+//! use bytes::Bytes;
+//! use resp_rs::resp2::{self, Frame};
+//!
+//! let data = Bytes::from("*3\r\n+SET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+//! let (frame, _) = resp2::parse_frame(data).unwrap();
+//!
+//! // Extract array items
+//! let items = frame.into_array().unwrap();
+//! assert_eq!(items[0].as_str(), Some("SET"));
+//! assert_eq!(items[1].as_str(), Some("key"));
+//! assert_eq!(items[2].as_str(), Some("value"));
+//! ```
+//!
+//! Available methods include:
+//!
+//! | Method | Returns | Works on |
+//! |--------|---------|----------|
+//! | `as_bytes()` | `Option<&Bytes>` | Strings, bulk strings, errors |
+//! | `as_str()` | `Option<&str>` | String-like frames with valid UTF-8 |
+//! | `as_integer()` | `Option<i64>` | `Integer` |
+//! | `as_double()` | `Option<f64>` | `Double` (RESP3 only) |
+//! | `as_boolean()` | `Option<bool>` | `Boolean` (RESP3 only) |
+//! | `as_array()` | `Option<&[Frame]>` | `Array` |
+//! | `as_map()` | `Option<&[(Frame, Frame)]>` | `Map` (RESP3 only) |
+//! | `into_array()` | `Result<Vec<Frame>, Frame>` | `Array` |
+//! | `into_bulk_string()` | `Result<Bytes, Frame>` | `BulkString` |
+//! | `into_map()` | `Result<Vec<(Frame, Frame)>, Frame>` | `Map` (RESP3 only) |
+//! | `is_null()` | `bool` | Any frame |
+//! | `is_error()` | `bool` | Any frame |
+//!
 //! # Performance
 //!
 //! The parser uses offset-based internal parsing to minimize allocations. Bulk string
