@@ -341,3 +341,128 @@ fn parser_rejects_deep_nesting() {
     parser.feed(nested_arrays(100_000));
     assert_eq!(parser.next_frame(), Err(ParseError::DepthExceeded));
 }
+
+// --- Integer sign and classification (issues #49, #55) ---
+//
+// These cases are transcribed from the RESP grammar `:[<+|->]<value>\r\n`,
+// not from frame_to_bytes. The serializer emits i64 via Display, which never
+// produces a leading `+`, so no test whose input comes from the serializer can
+// reach the signed form. That closed loop is why #49 went unnoticed.
+
+#[test]
+fn integer_accepts_explicit_plus() {
+    for (wire, want) in [
+        (&b":+42\r\n"[..], 42i64),
+        (&b":+0\r\n"[..], 0),
+        (&b":+1\r\n"[..], 1),
+        (&b":+9223372036854775807\r\n"[..], i64::MAX),
+    ] {
+        let (frame, rest) = resp2::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{:?}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        assert_eq!(
+            frame,
+            Frame::Integer(want),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn integer_sign_forms_agree() {
+    // The three spellings of the same value must parse identically.
+    let plus = resp2::parse_frame(Bytes::from_static(b":+42\r\n"))
+        .unwrap()
+        .0;
+    let bare = resp2::parse_frame(Bytes::from_static(b":42\r\n"))
+        .unwrap()
+        .0;
+    assert_eq!(plus, bare);
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":-42\r\n"))
+            .unwrap()
+            .0,
+        Frame::Integer(-42)
+    );
+}
+
+#[test]
+fn integer_rejects_malformed_signs() {
+    for wire in [
+        &b":+\r\n"[..],
+        &b":-\r\n"[..],
+        &b":++1\r\n"[..],
+        &b":+-1\r\n"[..],
+        &b":-+1\r\n"[..],
+        &b":1+\r\n"[..],
+        &b":+ 1\r\n"[..],
+    ] {
+        assert_eq!(
+            resp2::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn integer_signed_overflow_matches_unsigned() {
+    // Accepting the sign moves this from InvalidFormat to Overflow, which is
+    // the point: it should classify the same as the unsigned spelling.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":+9223372036854775808\r\n")),
+        Err(ParseError::Overflow)
+    );
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":9223372036854775808\r\n")),
+        Err(ParseError::Overflow)
+    );
+}
+
+#[test]
+fn trailing_junk_is_malformed_not_overflow() {
+    // The i64::MIN digits followed by junk are malformed, not out of range.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":-9223372036854775808X\r\n")),
+        Err(ParseError::InvalidFormat)
+    );
+    // Same shape one digit lower, which never tripped the guard.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":9223372036854775807X\r\n")),
+        Err(ParseError::InvalidFormat)
+    );
+    // i64::MIN itself must still parse, and one past it is still Overflow.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":-9223372036854775808\r\n"))
+            .unwrap()
+            .0,
+        Frame::Integer(i64::MIN)
+    );
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":-9223372036854775809\r\n")),
+        Err(ParseError::Overflow)
+    );
+}
+
+#[test]
+fn signed_integer_inside_an_aggregate() {
+    // The failure previously took the enclosing frame with it.
+    let (frame, _) = resp2::parse_frame(Bytes::from_static(b"*1\r\n:+42\r\n")).unwrap();
+    assert_eq!(frame, Frame::Array(Some(vec![Frame::Integer(42)])));
+}
+
+#[test]
+fn lengths_and_counts_still_reject_a_plus() {
+    // The sign is part of the integer grammar only. Lengths and counts have no
+    // sign, so a leading `+` must stay rejected there.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"$+5\r\nhello\r\n")),
+        Err(ParseError::BadLength)
+    );
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"*+1\r\n:1\r\n")),
+        Err(ParseError::BadLength)
+    );
+}

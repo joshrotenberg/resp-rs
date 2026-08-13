@@ -528,3 +528,106 @@ fn parser_rejects_deep_nesting() {
     parser.feed(nested("*1\r\n", 100_000));
     assert_eq!(parser.next_frame(), Err(ParseError::DepthExceeded));
 }
+
+// --- Integer sign and classification (issues #49, #55) ---
+//
+// Transcribed from the RESP grammar `:[<+|->]<value>\r\n`, not from
+// frame_to_bytes, which emits i64 via Display and so never produces a leading
+// `+`. Any test whose input comes from the serializer is blind to this form.
+
+#[test]
+fn integer_accepts_explicit_plus() {
+    for (wire, want) in [
+        (&b":+42\r\n"[..], 42i64),
+        (&b":+0\r\n"[..], 0),
+        (&b":+9223372036854775807\r\n"[..], i64::MAX),
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{:?}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        assert_eq!(
+            frame,
+            Frame::Integer(want),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn integer_rejects_malformed_signs() {
+    for wire in [
+        &b":+\r\n"[..],
+        &b":-\r\n"[..],
+        &b":++1\r\n"[..],
+        &b":+-1\r\n"[..],
+        &b":1+\r\n"[..],
+    ] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn integer_signed_overflow_matches_unsigned() {
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":+9223372036854775808\r\n")),
+        Err(ParseError::Overflow)
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":9223372036854775808\r\n")),
+        Err(ParseError::Overflow)
+    );
+}
+
+#[test]
+fn trailing_junk_is_malformed_not_overflow() {
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":-9223372036854775808X\r\n")),
+        Err(ParseError::InvalidFormat)
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":-9223372036854775808\r\n"))
+            .unwrap()
+            .0,
+        Frame::Integer(i64::MIN)
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":-9223372036854775809\r\n")),
+        Err(ParseError::Overflow)
+    );
+}
+
+#[test]
+fn signed_integer_inside_every_aggregate() {
+    // The failure previously took the enclosing frame with it, for all five
+    // recursing tags.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"*1\r\n:+42\r\n"))
+            .unwrap()
+            .0,
+        Frame::Array(Some(vec![Frame::Integer(42)]))
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"~1\r\n:+42\r\n"))
+            .unwrap()
+            .0,
+        Frame::Set(vec![Frame::Integer(42)])
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b">1\r\n:+42\r\n"))
+            .unwrap()
+            .0,
+        Frame::Push(vec![Frame::Integer(42)])
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"%1\r\n:+1\r\n:+2\r\n"))
+            .unwrap()
+            .0,
+        Frame::Map(vec![(Frame::Integer(1), Frame::Integer(2))])
+    );
+}
