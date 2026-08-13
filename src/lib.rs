@@ -188,7 +188,7 @@
 //! use resp_rs::resp3::{self, Frame};
 //!
 //! // Streaming string: $?\r\n followed by chunks, terminated by ;0\r\n
-//! let data = Bytes::from("$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n\r\n");
+//! let data = Bytes::from("$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n");
 //! let (frame, _) = resp3::parse_streaming_sequence(data).unwrap();
 //!
 //! if let Frame::StreamedString(chunks) = frame {

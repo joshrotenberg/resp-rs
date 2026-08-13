@@ -50,7 +50,22 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         any::<f64>()
             .prop_filter("finite", |f| f.is_finite())
             .prop_map(Frame::Double),
-        safe_line_bytes().prop_map(|b| Frame::BigNumber(Bytes::from(b))),
+        // A big number is an optional sign followed by one or more decimal
+        // digits (issue #58). Generating arbitrary line bytes here would assert
+        // a round trip the parser does not claim, since it now rejects payloads
+        // that are not big numbers.
+        (
+            prop::option::of(prop_oneof![Just('+'), Just('-')]),
+            prop::collection::vec(prop::num::u8::ANY.prop_map(|b| b'0' + b % 10), 1..40),
+        )
+            .prop_map(|(sign, digits)| {
+                let mut s = String::new();
+                if let Some(c) = sign {
+                    s.push(c);
+                }
+                s.push_str(core::str::from_utf8(&digits).unwrap());
+                Frame::BigNumber(Bytes::from(s))
+            }),
         prop::collection::vec(any::<u8>(), 0..256).prop_map(|b| Frame::BlobError(Bytes::from(b))),
         // VerbatimString: 3-byte format tag + arbitrary content
         (

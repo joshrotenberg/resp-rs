@@ -183,7 +183,7 @@ fn attribute_with_data() {
 
 #[test]
 fn streaming_string() {
-    let wire = Bytes::from("$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n\r\n");
+    let wire = Bytes::from("$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n");
     let (frame, rest) = resp3::parse_streaming_sequence(wire).unwrap();
     assert!(rest.is_empty());
     match frame {
@@ -815,4 +815,144 @@ fn attribute_wrapping_deep_content_respects_max_depth() {
         resp3::parse_frame(deep(resp3::MAX_DEPTH as usize)),
         Err(ParseError::DepthExceeded)
     );
+}
+
+// --- Scalar conformance (issues #57, #58, #62) ---
+
+#[test]
+fn null_and_terminator_distinguish_truncated_from_invalid() {
+    // Complete but invalid must not be reported as truncated, or Parser waits
+    // forever for data that cannot help.
+    for wire in [
+        &b"_x\r\n"[..],
+        &b"_\r\r\n"[..],
+        &b".x\r\n"[..],
+        &b".\r\r\n"[..],
+    ] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+
+    // Genuinely truncated still reports Incomplete.
+    for wire in [&b"_"[..], &b"_\r"[..], &b"."[..], &b".\r"[..]] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::Incomplete),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+
+    // Valid forms unchanged.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"_\r\n")).unwrap().0,
+        Frame::Null
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b".\r\n")).unwrap().0,
+        Frame::StreamTerminator
+    );
+}
+
+#[test]
+fn parser_terminates_on_a_malformed_null() {
+    // The regression that matters: Incomplete means "need more data", so a
+    // malformed null previously left the connection with no reason to close.
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::from_static(b"_x\r\n"));
+    assert_eq!(parser.next_frame(), Err(ParseError::InvalidFormat));
+}
+
+#[test]
+fn sibling_scalar_arms_are_unchanged() {
+    // Controls, so the null and terminator fix does not overshoot.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"#x\r\n")),
+        Err(ParseError::InvalidBoolean)
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b":x\r\n")),
+        Err(ParseError::InvalidFormat)
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"$x\r\n")),
+        Err(ParseError::BadLength)
+    );
+}
+
+#[test]
+fn big_number_requires_optional_sign_then_digits() {
+    for wire in [
+        &b"(\r\n"[..],
+        &b"(not-a-number\r\n"[..],
+        &b"(1.5\r\n"[..],
+        &b"(--1\r\n"[..],
+        &b"( 12\r\n"[..],
+        &b"(+\r\n"[..],
+        &b"(12x\r\n"[..],
+    ] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+
+    // The spec's example, unsigned and signed.
+    for wire in [
+        &b"(3492890328409238509324850943850943825024385\r\n"[..],
+        &b"(+3492890328409238509324850943850943825024385\r\n"[..],
+        &b"(-3492890328409238509324850943850943825024385\r\n"[..],
+        &b"(0\r\n"[..],
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        assert!(matches!(frame, Frame::BigNumber(_)));
+    }
+}
+
+#[test]
+fn streamed_string_terminator_is_four_bytes() {
+    // `;0\r\n`, not `;0\r\n\r\n`.
+    let wire = Bytes::from_static(b"$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n");
+    let (frame, rest) = resp3::parse_streaming_sequence(wire).unwrap();
+    assert!(rest.is_empty());
+    match frame {
+        Frame::StreamedString(chunks) => {
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0], Bytes::from_static(b"Hello"));
+            assert_eq!(chunks[1], Bytes::from_static(b" World"));
+        }
+        other => panic!("expected StreamedString, got {other:?}"),
+    }
+}
+
+#[test]
+fn streamed_string_terminator_round_trips() {
+    let frame = Frame::StreamedString(vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]);
+    let wire = resp3::frame_to_bytes(&frame);
+    assert_eq!(
+        wire,
+        Bytes::from_static(b"$?\r\n;2\r\nab\r\n;2\r\ncd\r\n;0\r\n")
+    );
+
+    let (reparsed, rest) = resp3::parse_streaming_sequence(wire).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(reparsed, frame);
+}
+
+#[test]
+fn empty_streamed_chunk_serializes_to_four_bytes() {
+    let wire = resp3::frame_to_bytes(&Frame::StreamedStringChunk(Bytes::new()));
+    assert_eq!(wire, Bytes::from_static(b";0\r\n"));
+
+    // A non-empty chunk still carries its trailing CRLF.
+    let wire = resp3::frame_to_bytes(&Frame::StreamedStringChunk(Bytes::from_static(b"hi")));
+    assert_eq!(wire, Bytes::from_static(b";2\r\nhi\r\n"));
 }

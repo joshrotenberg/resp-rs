@@ -232,7 +232,9 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let cr = find_cr(buf, pos + 1);
             let len = parse_usize_unchecked(buf.get_unchecked(pos + 1..cr));
             if len == 0 {
-                return (Frame::StreamedStringChunk(Bytes::new()), cr + 4);
+                // End-of-stream marker `;0\r\n`: four bytes, no payload and no
+                // trailing CRLF. Must match resp3::parse_streamed_chunk.
+                return (Frame::StreamedStringChunk(Bytes::new()), cr + 2);
             }
             let ds = cr + 2;
             let de = ds + len;
@@ -303,7 +305,7 @@ mod tests {
             "$?\r\n",
             "*?\r\n",
             ";5\r\nhello\r\n",
-            ";0\r\n\r\n",
+            ";0\r\n",
         ];
 
         for wire in cases {
