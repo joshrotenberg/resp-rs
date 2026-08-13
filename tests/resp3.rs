@@ -415,3 +415,116 @@ fn invalid_tag() {
         Err(ParseError::InvalidTag(b'Z'))
     );
 }
+
+// --- Nesting depth limit (issue #47) ---
+
+/// Build `depth` nested single-element aggregates wrapping an integer.
+///
+/// `header` is the repeat unit for one level. Maps and attributes need a key
+/// before the nested value, so their unit carries one.
+fn nested(header: &str, depth: usize) -> Bytes {
+    let mut s = String::with_capacity(depth * header.len() + 5);
+    for _ in 0..depth {
+        s.push_str(header);
+    }
+    s.push_str(":42\r\n");
+    Bytes::from(s)
+}
+
+/// Every RESP3 tag that recurses, with the repeat unit that nests it.
+const NESTING_TAGS: &[&str] = &[
+    "*1\r\n",       // array
+    "~1\r\n",       // set
+    ">1\r\n",       // push
+    "%1\r\n+k\r\n", // map: key then nested value
+    "|1\r\n+k\r\n", // attribute: key then nested value
+];
+
+#[test]
+fn nesting_at_max_depth_parses() {
+    for header in NESTING_TAGS {
+        let wire = nested(header, resp3::MAX_DEPTH as usize);
+        let (_, rest) =
+            resp3::parse_frame(wire).unwrap_or_else(|e| panic!("{}: {e:?}", header.escape_debug()));
+        assert!(rest.is_empty(), "{}", header.escape_debug());
+    }
+}
+
+#[test]
+fn nesting_past_max_depth_errors() {
+    for header in NESTING_TAGS {
+        assert_eq!(
+            resp3::parse_frame(nested(header, resp3::MAX_DEPTH as usize + 1)),
+            Err(ParseError::DepthExceeded),
+            "{}",
+            header.escape_debug()
+        );
+    }
+}
+
+#[test]
+fn nesting_far_past_max_depth_errors_instead_of_overflowing_stack() {
+    // Without a depth limit this aborts the process around 30,000 levels on an
+    // 8 MB stack, and around 7,500 on a 2 MB tokio worker.
+    for header in NESTING_TAGS {
+        assert_eq!(
+            resp3::parse_frame(nested(header, 100_000)),
+            Err(ParseError::DepthExceeded),
+            "{}",
+            header.escape_debug()
+        );
+    }
+}
+
+#[test]
+fn deep_nesting_errors_before_incomplete() {
+    // Truncated deep input: the depth limit must fire rather than reporting
+    // Incomplete, so a streaming caller fails fast instead of buffering more.
+    for header in NESTING_TAGS {
+        let wire = Bytes::from(header.repeat(100_000));
+        assert_eq!(
+            resp3::parse_frame(wire),
+            Err(ParseError::DepthExceeded),
+            "{}",
+            header.escape_debug()
+        );
+    }
+}
+
+#[test]
+fn empty_aggregate_does_not_spend_depth_budget() {
+    // MAX_DEPTH aggregates, the innermost empty: no recursion happens at the
+    // innermost level, so this is within budget.
+    for (header, empty) in [
+        ("*1\r\n", "*0\r\n"),
+        ("~1\r\n", "~0\r\n"),
+        ("%1\r\n+k\r\n", "%0\r\n"),
+    ] {
+        let mut s = header.repeat(resp3::MAX_DEPTH as usize - 1);
+        s.push_str(empty);
+        assert!(
+            resp3::parse_frame(Bytes::from(s)).is_ok(),
+            "{}",
+            header.escape_debug()
+        );
+    }
+}
+
+#[test]
+fn streaming_sequence_rejects_deep_nesting() {
+    // A streamed array whose first item is deeply nested: the inner parse_frame
+    // call carries the same bound.
+    let mut s = String::from("*?\r\n");
+    s.push_str(&"*1\r\n".repeat(100_000));
+    assert_eq!(
+        resp3::parse_streaming_sequence(Bytes::from(s)),
+        Err(ParseError::DepthExceeded)
+    );
+}
+
+#[test]
+fn parser_rejects_deep_nesting() {
+    let mut parser = resp3::Parser::new();
+    parser.feed(nested("*1\r\n", 100_000));
+    assert_eq!(parser.next_frame(), Err(ParseError::DepthExceeded));
+}

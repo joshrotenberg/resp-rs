@@ -144,6 +144,12 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
 /// complete RESP2 frame. Passing truncated, malformed, or empty input is
 /// **undefined behavior**.
 ///
+/// The caller **must also** bound array nesting depth. This function recurses
+/// once per level and has no depth limit of its own, so deeply nested input
+/// overflows the stack and aborts the process. Validating with
+/// [`super::parse_frame`] first is sufficient: it rejects anything deeper than
+/// [`super::MAX_DEPTH`].
+///
 /// # Examples
 ///
 /// ```

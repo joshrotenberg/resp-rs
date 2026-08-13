@@ -389,6 +389,22 @@
 //! // Empty input
 //! assert_eq!(resp2::parse_frame(Bytes::new()), Err(ParseError::Incomplete));
 //! ```
+//!
+//! ## Nesting depth
+//!
+//! Aggregates are parsed recursively, one stack frame per level, so input is
+//! rejected with [`ParseError::DepthExceeded`] past [`resp2::MAX_DEPTH`] /
+//! [`resp3::MAX_DEPTH`]. Without that bound a small input could nest deeply
+//! enough to overflow the stack, which aborts the process rather than raising a
+//! catchable panic.
+//!
+//! ```
+//! use bytes::Bytes;
+//! use resp_rs::{ParseError, resp2};
+//!
+//! let too_deep = Bytes::from("*1\r\n".repeat(resp2::MAX_DEPTH as usize + 1));
+//! assert_eq!(resp2::parse_frame(too_deep), Err(ParseError::DepthExceeded));
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -405,6 +421,7 @@ pub mod cluster;
 
 /// Errors that can occur during RESP parsing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// Not enough data to parse a complete frame.
     #[error("incomplete data")]
@@ -437,4 +454,10 @@ pub enum ParseError {
     /// Integer value overflowed i64 range.
     #[error("integer overflow")]
     Overflow,
+
+    /// Aggregate nesting exceeded the parser's depth limit.
+    ///
+    /// See [`resp2::MAX_DEPTH`] and [`resp3::MAX_DEPTH`].
+    #[error("maximum nesting depth exceeded")]
+    DepthExceeded,
 }

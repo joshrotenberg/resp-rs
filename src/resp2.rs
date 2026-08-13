@@ -34,6 +34,17 @@ const MAX_COLLECTION_SIZE: usize = 10_000_000;
 /// Maximum reasonable size for bulk string payloads (512 MB).
 const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 
+/// Maximum aggregate nesting depth accepted by the parser.
+///
+/// Arrays are parsed recursively, one stack frame per level, so an unbounded
+/// depth would let a small input overflow the stack and abort the process.
+/// Input nested more deeply than this is rejected with
+/// [`ParseError::DepthExceeded`].
+///
+/// Redis does not nest replies anywhere near this deep, so the limit is not
+/// reachable by real traffic.
+pub const MAX_DEPTH: u32 = 128;
+
 /// A parsed RESP2 frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
@@ -136,13 +147,21 @@ impl Frame {
 /// assert_eq!(rest, Bytes::from("rest"));
 /// ```
 pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
-    let (frame, consumed) = parse_frame_inner(&input, 0)?;
+    let (frame, consumed) = parse_frame_inner(&input, 0, MAX_DEPTH)?;
     Ok((frame, input.slice(consumed..)))
 }
 
 /// Offset-based internal parser. Works with byte positions to avoid creating
 /// intermediate `Bytes::slice()` objects. Only slices for actual frame data.
-pub(crate) fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usize), ParseError> {
+///
+/// `depth` is the remaining nesting budget. Each array spends one unit before
+/// recursing into its elements, so parsing fails with
+/// [`ParseError::DepthExceeded`] rather than overflowing the stack.
+pub(crate) fn parse_frame_inner(
+    input: &Bytes,
+    pos: usize,
+    depth: u32,
+) -> Result<(Frame, usize), ParseError> {
     let buf = input.as_ref();
     if pos >= buf.len() {
         return Err(ParseError::Incomplete);
@@ -212,10 +231,11 @@ pub(crate) fn parse_frame_inner(input: &Bytes, pos: usize) -> Result<(Frame, usi
             if count == 0 {
                 return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
+            let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
             let mut cursor = after_crlf;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (item, next) = parse_frame_inner(input, cursor)?;
+                let (item, next) = parse_frame_inner(input, cursor, child_depth)?;
                 items.push(item);
                 cursor = next;
             }
@@ -346,7 +366,7 @@ impl Parser {
 
         let bytes = self.buffer.split().freeze();
 
-        match parse_frame_inner(&bytes, 0) {
+        match parse_frame_inner(&bytes, 0, MAX_DEPTH) {
             Ok((frame, consumed)) => {
                 if consumed < bytes.len() {
                     self.buffer.unsplit(BytesMut::from(&bytes[consumed..]));

@@ -272,3 +272,72 @@ fn deeply_nested_array() {
     }
     assert_eq!(current, &Frame::Integer(42));
 }
+
+// --- Nesting depth limit (issue #47) ---
+
+/// Build `depth` nested single-element arrays wrapping an integer.
+fn nested_arrays(depth: usize) -> Bytes {
+    let mut s = String::with_capacity(depth * 4 + 5);
+    for _ in 0..depth {
+        s.push_str("*1\r\n");
+    }
+    s.push_str(":42\r\n");
+    Bytes::from(s)
+}
+
+#[test]
+fn nesting_at_max_depth_parses() {
+    let (frame, rest) = resp2::parse_frame(nested_arrays(resp2::MAX_DEPTH as usize)).unwrap();
+    assert!(rest.is_empty());
+
+    let mut current = &frame;
+    for _ in 0..resp2::MAX_DEPTH {
+        match current {
+            Frame::Array(Some(items)) => current = &items[0],
+            _ => panic!("expected array"),
+        }
+    }
+    assert_eq!(current, &Frame::Integer(42));
+}
+
+#[test]
+fn nesting_past_max_depth_errors() {
+    assert_eq!(
+        resp2::parse_frame(nested_arrays(resp2::MAX_DEPTH as usize + 1)),
+        Err(ParseError::DepthExceeded)
+    );
+}
+
+#[test]
+fn nesting_far_past_max_depth_errors_instead_of_overflowing_stack() {
+    // Without a depth limit this aborts the process around 30,000 levels on an
+    // 8 MB stack, and around 7,500 on a 2 MB tokio worker.
+    assert_eq!(
+        resp2::parse_frame(nested_arrays(100_000)),
+        Err(ParseError::DepthExceeded)
+    );
+}
+
+#[test]
+fn deep_nesting_errors_before_incomplete() {
+    // Truncated deep input: the depth limit must fire rather than reporting
+    // Incomplete, so a streaming caller fails fast instead of buffering more.
+    let wire = Bytes::from("*1\r\n".repeat(100_000));
+    assert_eq!(resp2::parse_frame(wire), Err(ParseError::DepthExceeded));
+}
+
+#[test]
+fn empty_array_does_not_spend_depth_budget() {
+    // MAX_DEPTH arrays, the innermost empty: no recursion happens at the
+    // innermost level, so this is within budget.
+    let mut s = "*1\r\n".repeat(resp2::MAX_DEPTH as usize - 1);
+    s.push_str("*0\r\n");
+    assert!(resp2::parse_frame(Bytes::from(s)).is_ok());
+}
+
+#[test]
+fn parser_rejects_deep_nesting() {
+    let mut parser = resp2::Parser::new();
+    parser.feed(nested_arrays(100_000));
+    assert_eq!(parser.next_frame(), Err(ParseError::DepthExceeded));
+}
