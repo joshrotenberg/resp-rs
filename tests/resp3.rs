@@ -956,3 +956,43 @@ fn empty_streamed_chunk_serializes_to_four_bytes() {
     let wire = resp3::frame_to_bytes(&Frame::StreamedStringChunk(Bytes::from_static(b"hi")));
     assert_eq!(wire, Bytes::from_static(b";2\r\nhi\r\n"));
 }
+
+// --- Line length ceiling (issue #63) ---
+
+#[test]
+fn unterminated_line_is_rejected_for_every_line_type() {
+    for tag in [
+        "+", "-", ":", "(", ",", "#", "!", "=", "$", "*", "%", "~", ">",
+    ] {
+        let mut wire = tag.to_string();
+        wire.push_str(&"x".repeat(resp3::MAX_LINE_LENGTH + 1));
+        assert_eq!(
+            resp3::parse_frame(Bytes::from(wire)),
+            Err(ParseError::LineTooLong),
+            "tag {tag}"
+        );
+    }
+}
+
+#[test]
+fn a_line_at_the_limit_still_parses() {
+    let mut wire = String::from("+");
+    wire.push_str(&"y".repeat(resp3::MAX_LINE_LENGTH));
+    wire.push_str("\r\n");
+    let (frame, rest) = resp3::parse_frame(Bytes::from(wire)).unwrap();
+    assert!(rest.is_empty());
+    assert!(matches!(frame, Frame::SimpleString(ref b) if b.len() == resp3::MAX_LINE_LENGTH));
+}
+
+#[test]
+fn bulk_string_body_is_not_subject_to_the_line_ceiling() {
+    // The ceiling applies to CRLF-scanned lines. A bulk string body is
+    // length-prefixed and read directly, so large payloads still work.
+    let body = vec![b'z'; resp3::MAX_LINE_LENGTH * 4];
+    let mut wire = format!("${}\r\n", body.len()).into_bytes();
+    wire.extend_from_slice(&body);
+    wire.extend_from_slice(b"\r\n");
+    let (frame, rest) = resp3::parse_frame(Bytes::from(wire)).unwrap();
+    assert!(rest.is_empty());
+    assert!(matches!(frame, Frame::BulkString(Some(ref b)) if b.len() == body.len()));
+}

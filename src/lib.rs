@@ -460,4 +460,10 @@ pub enum ParseError {
     /// See [`resp2::MAX_DEPTH`] and [`resp3::MAX_DEPTH`].
     #[error("maximum nesting depth exceeded")]
     DepthExceeded,
+
+    /// A CRLF-terminated line exceeded the parser's length limit.
+    ///
+    /// See [`resp2::MAX_LINE_LENGTH`] and [`resp3::MAX_LINE_LENGTH`].
+    #[error("maximum line length exceeded")]
+    LineTooLong,
 }
