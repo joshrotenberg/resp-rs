@@ -231,6 +231,12 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
 /// The caller **must** guarantee that `input` contains at least one valid,
 /// complete RESP3 frame. Passing truncated, malformed, or empty input is
 /// **undefined behavior**.
+///
+/// The caller **must also** bound aggregate nesting depth. This function
+/// recurses once per level and has no depth limit of its own, so deeply nested
+/// input overflows the stack and aborts the process. Validating with
+/// [`super::parse_frame`] first is sufficient: it rejects anything deeper than
+/// [`super::MAX_DEPTH`].
 pub unsafe fn parse_frame_unchecked(input: Bytes) -> (Frame, Bytes) {
     let (frame, consumed) = parse_inner(&input, 0);
     (frame, input.slice(consumed..))

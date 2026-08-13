@@ -4,7 +4,7 @@ use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::codec::CodecError;
-use crate::resp3::{Frame, frame_to_bytes, parse_frame_inner};
+use crate::resp3::{Frame, MAX_DEPTH, frame_to_bytes, parse_frame_inner};
 
 /// A Tokio codec for RESP3 frames.
 ///
@@ -61,7 +61,7 @@ impl Decoder for Codec {
 
         let frozen = src.clone().freeze();
 
-        match parse_frame_inner(&frozen, 0) {
+        match parse_frame_inner(&frozen, 0, MAX_DEPTH) {
             Ok((frame, consumed)) => {
                 src.advance(consumed);
                 Ok(Some(frame))

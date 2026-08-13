@@ -1,3 +1,6 @@
+# cargo-fuzz builds this as its own workspace, separate from the root one.
+[workspace]
+
 [package]
 name = "resp-rs-fuzz"
 version = "0.0.0"
@@ -73,6 +76,13 @@ bench = false
 [[bin]]
 name = "fuzz_resp3_streaming_sequence"
 path = "fuzz_targets/fuzz_resp3_streaming_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_nesting"
+path = "fuzz_targets/fuzz_nesting.rs"
 test = false
 doc = false
 bench = false
