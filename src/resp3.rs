@@ -637,6 +637,41 @@ fn parse_collection(
     }
 }
 
+/// Check that a tag with no payload is followed by exactly CRLF.
+///
+/// The bounds check and the content check are separate on purpose. Folding them
+/// into one error path reports a complete but invalid frame such as `_x\r\n` as
+/// [`ParseError::Incomplete`], which `Parser` reads as "need more data", so a
+/// peer sending it is never rejected and the parser waits forever.
+#[inline]
+fn check_bare_crlf(buf: &[u8], pos: usize) -> Result<(), ParseError> {
+    if pos + 2 >= buf.len() {
+        return Err(ParseError::Incomplete);
+    }
+    if buf[pos + 1] != b'\r' || buf[pos + 2] != b'\n' {
+        return Err(ParseError::InvalidFormat);
+    }
+    Ok(())
+}
+
+/// Check a big number payload against the grammar: an optional sign followed by
+/// one or more decimal digits.
+///
+/// Without this the arm hands back whatever the line held, and `frame_to_bytes`
+/// re-emits it verbatim, so the crate would both accept and reproduce
+/// non-conforming wire bytes.
+#[inline]
+fn check_big_number(payload: &[u8]) -> Result<(), ParseError> {
+    let digits = match payload.first() {
+        Some(b'+') | Some(b'-') => &payload[1..],
+        _ => payload,
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(ParseError::InvalidFormat);
+    }
+    Ok(())
+}
+
 /// Read one aggregate element, skipping any attributes that precede it.
 ///
 /// An attribute is not a reply. It carries out-of-band metadata for the frame
@@ -716,15 +751,18 @@ fn parse_streamed_chunk(
     if len > MAX_BULK_STRING_SIZE {
         return Err(ParseError::BadLength);
     }
-    let (data_start, data_end) = parse_blob_bounds(buf, after_crlf, len)?;
-    if data_start == data_end {
-        Ok((Frame::StreamedStringChunk(Bytes::new()), after_crlf + 2))
-    } else {
-        Ok((
-            Frame::StreamedStringChunk(input.slice(data_start..data_end)),
-            data_end + 2,
-        ))
+    // A zero-length chunk is the end-of-stream marker and is exactly `;0\r\n`,
+    // four bytes with no payload and no trailing CRLF. This cannot share
+    // `parse_blob_bounds` with `$` and `!`, where a zero length does carry its
+    // own trailing CRLF (`$0\r\n\r\n`).
+    if len == 0 {
+        return Ok((Frame::StreamedStringChunk(Bytes::new()), after_crlf));
     }
+    let (data_start, data_end) = parse_blob_bounds(buf, after_crlf, len)?;
+    Ok((
+        Frame::StreamedStringChunk(input.slice(data_start..data_end)),
+        data_end + 2,
+    ))
 }
 
 /// Offset-based internal parser. The match body is kept minimal to reduce
@@ -774,21 +812,17 @@ pub(crate) fn parse_frame_inner(
         }
         b'(' => {
             let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let payload = &buf[pos + 1..line_end];
+            check_big_number(payload)?;
             Ok((Frame::BigNumber(input.slice(pos + 1..line_end)), after_crlf))
         }
         b'_' => {
-            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
-                Ok((Frame::Null, pos + 3))
-            } else {
-                Err(ParseError::Incomplete)
-            }
+            check_bare_crlf(buf, pos)?;
+            Ok((Frame::Null, pos + 3))
         }
         b'.' => {
-            if pos + 2 < buf.len() && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
-                Ok((Frame::StreamTerminator, pos + 3))
-            } else {
-                Err(ParseError::Incomplete)
-            }
+            check_bare_crlf(buf, pos)?;
+            Ok((Frame::StreamTerminator, pos + 3))
         }
 
         // Length-prefixed types (extracted to reduce icache pressure)
@@ -840,7 +874,7 @@ pub use codec_impl::Codec;
 /// use resp_rs::resp3::{parse_streaming_sequence, Frame};
 /// use bytes::Bytes;
 ///
-/// let data = Bytes::from("$?\r\n;4\r\nHell\r\n;6\r\no worl\r\n;1\r\nd\r\n;0\r\n\r\n");
+/// let data = Bytes::from("$?\r\n;4\r\nHell\r\n;6\r\no worl\r\n;1\r\nd\r\n;0\r\n");
 /// let (frame, rest) = parse_streaming_sequence(data).unwrap();
 ///
 /// if let Frame::StreamedString(chunks) = frame {
@@ -1246,8 +1280,12 @@ fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
             let len = data.len().to_string();
             buf.extend_from_slice(len.as_bytes());
             buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(data);
-            buf.extend_from_slice(b"\r\n");
+            // A zero-length chunk is the end-of-stream marker, `;0\r\n`, with
+            // no payload and no trailing CRLF.
+            if !data.is_empty() {
+                buf.extend_from_slice(data);
+                buf.extend_from_slice(b"\r\n");
+            }
         }
         Frame::StreamedString(chunks) => {
             // Serialize as streaming string sequence: $?\r\n + chunks + terminator
@@ -1260,7 +1298,7 @@ fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
                 buf.extend_from_slice(chunk);
                 buf.extend_from_slice(b"\r\n");
             }
-            buf.extend_from_slice(b";0\r\n\r\n");
+            buf.extend_from_slice(b";0\r\n");
         }
         Frame::StreamedArray(items) => {
             buf.extend_from_slice(b"*?\r\n");
@@ -2063,7 +2101,7 @@ mod tests {
                 Frame::StreamedStringChunk(Bytes::from("o wor")),
             ),
             (";1\r\nd\r\n", Frame::StreamedStringChunk(Bytes::from("d"))),
-            (";0\r\n\r\n", Frame::StreamedStringChunk(Bytes::new())),
+            (";0\r\n", Frame::StreamedStringChunk(Bytes::new())),
             (
                 ";11\r\nHello World\r\n",
                 Frame::StreamedStringChunk(Bytes::from("Hello World")),
@@ -2111,10 +2149,11 @@ mod tests {
         let result = parse_frame(data);
         assert!(matches!(result, Err(ParseError::Incomplete)));
 
-        // Test zero-length chunk without trailing CRLF returns Incomplete
+        // Zero-length chunk is the four-byte end-of-stream marker (#62).
         let data = Bytes::from(";0\r\n");
-        let result = parse_frame(data);
-        assert!(matches!(result, Err(ParseError::Incomplete)));
+        let (frame, rest) = parse_frame(data).unwrap();
+        assert_eq!(frame, Frame::StreamedStringChunk(Bytes::new()));
+        assert!(rest.is_empty());
 
         // Test binary data in chunk
         let binary_data = b"\x00\x01\x02\x03\xFF";
@@ -2140,7 +2179,7 @@ mod tests {
             Bytes::from("ld"),
         ]);
         let serialized = frame_to_bytes(&streaming_string);
-        let expected = "$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;2\r\nld\r\n;0\r\n\r\n";
+        let expected = "$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;2\r\nld\r\n;0\r\n";
         assert_eq!(serialized, Bytes::from(expected));
 
         let (parsed, _) = parse_streaming_sequence(serialized).unwrap();
@@ -2174,7 +2213,7 @@ mod tests {
         // Test empty streaming string
         let empty_streaming = Frame::StreamedString(vec![]);
         let serialized = frame_to_bytes(&empty_streaming);
-        let expected = "$?\r\n;0\r\n\r\n";
+        let expected = "$?\r\n;0\r\n";
         assert_eq!(serialized, Bytes::from(expected));
         let (parsed, _) = parse_streaming_sequence(serialized).unwrap();
         assert_eq!(parsed, empty_streaming);
@@ -2292,10 +2331,11 @@ mod tests {
         let result = parse_streaming_sequence(data);
         assert!(matches!(result, Err(ParseError::InvalidFormat)));
 
-        // Test streaming sequence with corrupted terminator
+        // A corrupted terminator is a complete, invalid frame, so it is
+        // rejected rather than reported as truncated (#57).
         let data = Bytes::from("*?\r\n+hello\r\n.corrupted\r\n");
         let result = parse_streaming_sequence(data);
-        assert!(matches!(result, Err(ParseError::Incomplete)));
+        assert!(matches!(result, Err(ParseError::InvalidFormat)));
 
         // Test empty input to parse_streaming_sequence
         let data = Bytes::new();
@@ -2369,20 +2409,33 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_length_streamed_chunk_requires_trailing_crlf() {
-        // Complete: ;0\r\n\r\n
-        let input = Bytes::from(";0\r\n\r\nTAIL");
+    fn test_zero_length_streamed_chunk_is_four_bytes() {
+        // The end-of-stream marker is `;0\r\n`, with no payload and no trailing
+        // CRLF. This test previously asserted the opposite (issue #62): the
+        // chunk type borrowed the zero-length rule from `$` and `!`, where a
+        // zero length does carry its own CRLF.
+        let input = Bytes::from(";0\r\nTAIL");
         let (frame, rest) = parse_frame(input).unwrap();
         assert_eq!(frame, Frame::StreamedStringChunk(Bytes::new()));
         assert_eq!(rest, Bytes::from("TAIL"));
 
-        // Incomplete: ;0\r\n with no trailing data
+        // Consumes exactly four bytes, leaving anything after it alone.
         let input = Bytes::from(";0\r\n");
-        assert_eq!(parse_frame(input), Err(ParseError::Incomplete));
+        let (frame, rest) = parse_frame(input).unwrap();
+        assert_eq!(frame, Frame::StreamedStringChunk(Bytes::new()));
+        assert!(rest.is_empty());
 
-        // Invalid: ;0\r\n followed by non-CRLF
-        let input = Bytes::from(";0\r\nXY");
-        assert_eq!(parse_frame(input), Err(ParseError::InvalidFormat));
+        // Truncated header is still incomplete.
+        assert_eq!(
+            parse_frame(Bytes::from(";0\r")),
+            Err(ParseError::Incomplete)
+        );
+
+        // A non-empty chunk still carries its trailing CRLF.
+        let input = Bytes::from(";2\r\nhi\r\n");
+        let (frame, rest) = parse_frame(input).unwrap();
+        assert_eq!(frame, Frame::StreamedStringChunk(Bytes::from("hi")));
+        assert!(rest.is_empty());
     }
 
     #[test]
@@ -2599,7 +2652,7 @@ mod tests {
     #[test]
     fn test_empty_streaming_containers() {
         // Empty streaming string
-        let data = Bytes::from("$?\r\n;0\r\n\r\n");
+        let data = Bytes::from("$?\r\n;0\r\n");
         let (frame, _) = parse_streaming_sequence(data).unwrap();
         assert_eq!(frame, Frame::StreamedString(vec![]));
 
