@@ -625,7 +625,7 @@ fn parse_collection(
     let mut cursor = after_crlf;
     let mut items = Vec::with_capacity(bounded_capacity(buf, after_crlf, count, 1));
     for _ in 0..count {
-        let (item, next) = parse_frame_inner(input, cursor, child_depth)?;
+        let (item, next) = parse_element(input, cursor, child_depth)?;
         items.push(item);
         cursor = next;
     }
@@ -634,6 +634,35 @@ fn parse_collection(
         b'~' => Ok((Frame::Set(items), cursor)),
         b'>' => Ok((Frame::Push(items), cursor)),
         _ => unreachable!(),
+    }
+}
+
+/// Read one aggregate element, skipping any attributes that precede it.
+///
+/// An attribute is not a reply. It carries out-of-band metadata for the frame
+/// that follows, so it does not occupy an element slot: a `*3` header followed
+/// by an attribute is followed by four frames, not three.
+///
+/// Counting the attribute as an element does not merely produce a wrong tree.
+/// The aggregate finishes one element early and the real element is left in the
+/// buffer, where it is returned as the reply to the next command, silently
+/// shifting every reply after it.
+///
+/// The metadata is discarded. Attaching it instead, as redis-protocol does,
+/// would need a field on every [`Frame`] variant, which breaks the API and
+/// grows the type. Dropping it keeps this to the desynchronization.
+///
+/// A bare attribute parsed on its own is unaffected and still yields
+/// [`Frame::Attribute`]; only the in-aggregate position is handled here.
+#[inline]
+fn parse_element(input: &Bytes, pos: usize, depth: u32) -> Result<(Frame, usize), ParseError> {
+    let mut cursor = pos;
+    loop {
+        let (frame, next) = parse_frame_inner(input, cursor, depth)?;
+        cursor = next;
+        if !matches!(frame, Frame::Attribute(_)) {
+            return Ok((frame, cursor));
+        }
     }
 }
 
@@ -662,8 +691,8 @@ fn parse_pairs(
     if count > 0 {
         let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
         for _ in 0..count {
-            let (key, next1) = parse_frame_inner(input, cursor, child_depth)?;
-            let (val, next2) = parse_frame_inner(input, next1, child_depth)?;
+            let (key, next1) = parse_element(input, cursor, child_depth)?;
+            let (val, next2) = parse_element(input, next1, child_depth)?;
             pairs.push((key, val));
             cursor = next2;
         }
@@ -2281,13 +2310,39 @@ mod tests {
 
     #[test]
     fn test_roundtrip_nested_structures() {
-        // Test a complex nested structure
+        // Test a complex nested structure.
+        //
+        // The trailing `|1\r\n+meta\r\n+data\r\n` is an attribute, which does
+        // not occupy an element slot, so a real third element follows it. This
+        // input previously ended at the attribute and parsed only because the
+        // attribute was miscounted as that third element (issue #59).
         let original = Bytes::from(
-            "*3\r\n+hello\r\n%2\r\n+key1\r\n:123\r\n+key2\r\n~1\r\n+item\r\n|1\r\n+meta\r\n+data\r\n",
+            "*3\r\n+hello\r\n%2\r\n+key1\r\n:123\r\n+key2\r\n~1\r\n+item\r\n|1\r\n+meta\r\n+data\r\n:42\r\n",
         );
-        let (frame, _) = parse_frame(original.clone()).unwrap();
-        let serialized = frame_to_bytes(&frame);
+        let (frame, rest) = parse_frame(original.clone()).unwrap();
+        assert!(rest.is_empty());
 
+        // The attribute is metadata and is dropped, so the array holds the
+        // three real elements.
+        assert_eq!(
+            frame,
+            Frame::Array(Some(vec![
+                Frame::SimpleString(Bytes::from("hello")),
+                Frame::Map(vec![
+                    (
+                        Frame::SimpleString(Bytes::from("key1")),
+                        Frame::Integer(123)
+                    ),
+                    (
+                        Frame::SimpleString(Bytes::from("key2")),
+                        Frame::Set(vec![Frame::SimpleString(Bytes::from("item"))])
+                    ),
+                ]),
+                Frame::Integer(42),
+            ]))
+        );
+
+        let serialized = frame_to_bytes(&frame);
         let (reparsed, _) = parse_frame(serialized).unwrap();
         assert_eq!(frame, reparsed);
     }

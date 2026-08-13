@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ba43a40b199497bdac8a780f25d25157fdf2b62950548cbaf67b4b1639573ee # shrinks to frames = [Map([(SimpleString(b""), Attribute([]))])], split_points = [0]
+cc ac9ee17e16b1b946a21e71dacbca33de217b07004b0ecb10edb3bf403f85af25 # shrinks to frame = Set([Attribute([])])

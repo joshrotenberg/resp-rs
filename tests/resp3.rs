@@ -431,13 +431,19 @@ fn nested(header: &str, depth: usize) -> Bytes {
     Bytes::from(s)
 }
 
-/// Every RESP3 tag that recurses, with the repeat unit that nests it.
+/// Every RESP3 tag that recurses through a repeatable unit, with that unit.
+///
+/// `|` is absent deliberately. An attribute carries metadata for the frame that
+/// follows and is skipped where a frame is expected (issue #59), so a chain of
+/// attributes never reaches a real frame and is not well-formed input. The
+/// attribute depth path is `parse_pairs`, which is the same function `%`
+/// exercises above; `attribute_wrapping_deep_content_respects_max_depth` covers
+/// the `|` tag specifically.
 const NESTING_TAGS: &[&str] = &[
     "*1\r\n",       // array
     "~1\r\n",       // set
     ">1\r\n",       // push
     "%1\r\n+k\r\n", // map: key then nested value
-    "|1\r\n+k\r\n", // attribute: key then nested value
 ];
 
 #[test]
@@ -629,5 +635,184 @@ fn signed_integer_inside_every_aggregate() {
             .unwrap()
             .0,
         Frame::Map(vec![(Frame::Integer(1), Frame::Integer(2))])
+    );
+}
+
+// --- Attributes must not consume an element slot (issue #59) ---
+//
+// An attribute is not a reply. It carries metadata for the frame that follows,
+// so a `*3` header followed by an attribute is followed by four frames. When an
+// attribute eats a slot the aggregate ends early and the real element is left
+// in the buffer, which shifts every subsequent reply on the connection.
+
+#[test]
+fn spec_attribute_example_parses_as_three_elements() {
+    // Straight from the spec's Attributes section.
+    let wire = Bytes::from_static(b"*3\r\n:1\r\n:2\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n");
+    let (frame, rest) = resp3::parse_frame(wire).unwrap();
+    assert!(rest.is_empty(), "left {rest:?} unconsumed");
+    assert_eq!(
+        frame,
+        Frame::Array(Some(vec![
+            Frame::Integer(1),
+            Frame::Integer(2),
+            Frame::Integer(3)
+        ]))
+    );
+}
+
+#[test]
+fn attribute_in_any_element_position() {
+    let attr = "|1\r\n+ttl\r\n:3600\r\n";
+    for wire in [
+        format!("*3\r\n{attr}:1\r\n:2\r\n:3\r\n"), // first
+        format!("*3\r\n:1\r\n{attr}:2\r\n:3\r\n"), // middle
+        format!("*3\r\n:1\r\n:2\r\n{attr}:3\r\n"), // last
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::from(wire.clone()))
+            .unwrap_or_else(|e| panic!("{wire:?}: {e:?}"));
+        assert!(rest.is_empty(), "{wire:?} left {rest:?}");
+        assert_eq!(
+            frame,
+            Frame::Array(Some(vec![
+                Frame::Integer(1),
+                Frame::Integer(2),
+                Frame::Integer(3)
+            ])),
+            "{wire:?}"
+        );
+    }
+}
+
+#[test]
+fn consecutive_attributes_before_one_element() {
+    let wire = Bytes::from_static(b"*1\r\n|1\r\n+a\r\n:1\r\n|1\r\n+b\r\n:2\r\n:42\r\n");
+    let (frame, rest) = resp3::parse_frame(wire).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(frame, Frame::Array(Some(vec![Frame::Integer(42)])));
+}
+
+#[test]
+fn attribute_before_a_map_key_or_value() {
+    let attr = "|1\r\n+ttl\r\n:3600\r\n";
+    for wire in [
+        format!("%1\r\n{attr}+k\r\n+v\r\n"), // before the key
+        format!("%1\r\n+k\r\n{attr}+v\r\n"), // before the value
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::from(wire.clone()))
+            .unwrap_or_else(|e| panic!("{wire:?}: {e:?}"));
+        assert!(rest.is_empty(), "{wire:?} left {rest:?}");
+        assert_eq!(
+            frame,
+            Frame::Map(vec![(
+                Frame::SimpleString(Bytes::from_static(b"k")),
+                Frame::SimpleString(Bytes::from_static(b"v"))
+            )]),
+            "{wire:?}"
+        );
+    }
+}
+
+#[test]
+fn attribute_skipped_in_every_aggregate_type() {
+    let attr = "|1\r\n+ttl\r\n:3600\r\n";
+    for (tag, build) in [
+        ("*", Frame::Array(Some(vec![Frame::Integer(1)]))),
+        ("~", Frame::Set(vec![Frame::Integer(1)])),
+        (">", Frame::Push(vec![Frame::Integer(1)])),
+    ] {
+        let wire = format!("{tag}1\r\n{attr}:1\r\n");
+        let (frame, rest) = resp3::parse_frame(Bytes::from(wire.clone()))
+            .unwrap_or_else(|e| panic!("{wire:?}: {e:?}"));
+        assert!(rest.is_empty(), "{wire:?}");
+        assert_eq!(frame, build, "{wire:?}");
+    }
+}
+
+#[test]
+fn bare_attribute_still_parses_as_an_attribute() {
+    // Only the in-aggregate position changes. A standalone attribute is
+    // unaffected.
+    let (frame, rest) = resp3::parse_frame(Bytes::from_static(b"|1\r\n+ttl\r\n:3600\r\n")).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(
+        frame,
+        Frame::Attribute(vec![(
+            Frame::SimpleString(Bytes::from_static(b"ttl")),
+            Frame::Integer(3600)
+        )])
+    );
+}
+
+#[test]
+fn attribute_inside_a_nested_aggregate_does_not_disturb_the_outer_count() {
+    let wire = Bytes::from_static(b"*2\r\n*1\r\n|1\r\n+a\r\n:1\r\n:9\r\n+tail\r\n");
+    let (frame, rest) = resp3::parse_frame(wire).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(
+        frame,
+        Frame::Array(Some(vec![
+            Frame::Array(Some(vec![Frame::Integer(9)])),
+            Frame::SimpleString(Bytes::from_static(b"tail")),
+        ]))
+    );
+}
+
+#[test]
+fn attribute_does_not_shift_pipelined_reply_boundaries() {
+    // The regression that matters: a stolen slot leaves the real element in the
+    // buffer, where it is returned as the reply to the next command.
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::from_static(
+        b"*3\r\n:1\r\n:2\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n",
+    ));
+    parser.feed(Bytes::from_static(b"+SECOND\r\n"));
+
+    assert_eq!(
+        parser.next_frame().unwrap().unwrap(),
+        Frame::Array(Some(vec![
+            Frame::Integer(1),
+            Frame::Integer(2),
+            Frame::Integer(3)
+        ]))
+    );
+    assert_eq!(
+        parser.next_frame().unwrap().unwrap(),
+        Frame::SimpleString(Bytes::from_static(b"SECOND"))
+    );
+    assert_eq!(parser.next_frame().unwrap(), None);
+}
+
+#[test]
+fn truncated_attribute_inside_an_aggregate_reports_incomplete() {
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"*1\r\n|1\r\n+ttl\r\n")),
+        Err(ParseError::Incomplete)
+    );
+}
+
+#[test]
+fn attribute_wrapping_deep_content_respects_max_depth() {
+    // `|` cannot be chained (see NESTING_TAGS), so its depth accounting is
+    // checked by wrapping a deep array: the attribute spends one level and the
+    // array spends the rest.
+    let deep = |levels: usize| {
+        let mut s = String::from("|1\r\n+k\r\n");
+        s.push_str(&"*1\r\n".repeat(levels));
+        s.push_str(":42\r\n");
+        Bytes::from(s)
+    };
+
+    // One attribute plus MAX_DEPTH - 1 arrays is exactly at the limit.
+    let (frame, rest) = resp3::parse_frame(deep(resp3::MAX_DEPTH as usize - 1)).unwrap();
+    assert!(rest.is_empty());
+    // Skipping applies where an element is expected. Here the attribute is the
+    // whole frame, so it is returned as itself with the array as its value.
+    assert!(matches!(frame, Frame::Attribute(_)));
+
+    // One deeper exceeds it.
+    assert_eq!(
+        resp3::parse_frame(deep(resp3::MAX_DEPTH as usize)),
+        Err(ParseError::DepthExceeded)
     );
 }
