@@ -226,7 +226,7 @@ fn bench_resp3_streaming(c: &mut Criterion) {
     let mut group = c.benchmark_group("resp3_streaming");
 
     group.bench_function("streamed_string", |b| {
-        let data = Bytes::from("$?\r\n;5\r\nhello\r\n;6\r\n world\r\n;0\r\n\r\n");
+        let data = Bytes::from("$?\r\n;5\r\nhello\r\n;6\r\n world\r\n;0\r\n");
         b.iter(|| resp_rs::resp3::parse_streaming_sequence(data.clone()).unwrap());
     });
 
