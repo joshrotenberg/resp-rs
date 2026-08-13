@@ -12,11 +12,23 @@ use bytes::Bytes;
 
 use crate::resp3::Frame;
 
+/// Find the CRLF terminating a line, starting at `from`. Returns the position
+/// of the `\r`.
+///
+/// Scans for the `\r\n` pair, not a bare `\r`, so that it agrees with the safe
+/// [`crate::resp3::find_crlf`]. See the RESP2 counterpart for the reasoning.
+///
+/// # Safety
+///
+/// Caller must ensure `buf[from..]` contains a `\r\n` pair before the end of
+/// the allocation.
 #[inline(always)]
 unsafe fn find_cr(buf: &[u8], from: usize) -> usize {
     let ptr = buf.as_ptr();
     let mut i = from;
-    while *ptr.add(i) != b'\r' {
+    // SAFETY: caller guarantees a CRLF exists in bounds, at some index j with
+    // j + 1 in bounds. The loop only reads i + 1 while i < j, so i + 1 <= j.
+    while !(*ptr.add(i) == b'\r' && *ptr.add(i + 1) == b'\n') {
         i += 1;
     }
     i
@@ -306,6 +318,10 @@ mod tests {
             "*?\r\n",
             ";5\r\nhello\r\n",
             ";0\r\n",
+            // Bare CR inside a payload is data, not a line terminator (#65).
+            "+a\rb\r\n",
+            "-a\rb\r\n",
+            "*2\r\n+a\rZ+b\r\n+x\r\n",
         ];
 
         for wire in cases {

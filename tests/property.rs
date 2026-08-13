@@ -5,11 +5,17 @@ use proptest::prelude::*;
 // Arbitrary frame generators
 // ---------------------------------------------------------------------------
 
-/// Generate a byte string that is safe for RESP simple strings / errors
-/// (no \r or \n characters).
+/// Generate a byte string that is safe for RESP simple strings / errors.
+///
+/// Only `\n` is excluded. A payload with no `\n` cannot contain `\r\n`, so it
+/// cannot terminate its own line, which is the actual constraint. A bare `\r`
+/// is ordinary payload data and is deliberately included: excluding it also
+/// excluded the only byte on which the safe and unchecked parsers disagreed
+/// (issue #65), so the equivalence properties were asserting equivalence over
+/// an alphabet chosen to omit the counterexample.
 fn safe_line_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(
-        prop::num::u8::ANY.prop_filter("no CR/LF", |b| *b != b'\r' && *b != b'\n'),
+        prop::num::u8::ANY.prop_filter("no LF", |b| *b != b'\n'),
         0..128,
     )
 }
