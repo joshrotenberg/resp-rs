@@ -1056,25 +1056,33 @@ fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
     Ok(v)
 }
 
-/// Parse an `i64` directly from ASCII bytes (optional leading `-`), no UTF-8 validation.
+/// Parse an `i64` directly from ASCII bytes, no UTF-8 validation.
+///
+/// The sign is optional and may be `+` or `-`, matching the grammar
+/// `:[<+|->]<value>\r\n`. Redis does not emit the `+` form, but the spec
+/// allows it and other peers do.
 #[inline]
 fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
     if buf.is_empty() {
         return Err(ParseError::InvalidFormat);
     }
-    let (neg, digits) = if buf[0] == b'-' {
-        (true, &buf[1..])
-    } else {
-        (false, buf)
+    let (neg, digits) = match buf[0] {
+        b'-' => (true, &buf[1..]),
+        b'+' => (false, &buf[1..]),
+        _ => (false, buf),
     };
     if digits.is_empty() {
         return Err(ParseError::InvalidFormat);
     }
+    // Validate the whole run before accumulating. Deciding this per iteration
+    // lets an earlier byte return Overflow on input that is merely malformed:
+    // the i64::MIN case below is guarded on the digit being last, and trailing
+    // junk inflates the length so that guard misses.
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Err(ParseError::InvalidFormat);
+    }
     let mut v: i64 = 0;
     for (i, &d) in digits.iter().enumerate() {
-        if !d.is_ascii_digit() {
-            return Err(ParseError::InvalidFormat);
-        }
         let digit = (d - b'0') as i64;
         if neg && v == i64::MAX / 10 && digit == 8 && i == digits.len() - 1 {
             return Ok(i64::MIN);
