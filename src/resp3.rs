@@ -36,6 +36,19 @@ const MAX_COLLECTION_SIZE: usize = 10_000_000;
 /// Maximum reasonable size for bulk string/blob/chunk payloads (512 MB).
 const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 
+/// Upper bound on how many elements are reserved before any are parsed.
+///
+/// Clamping to the remaining bytes is not sufficient on its own. That clamp is
+/// per level, and every enclosing collection holds its reservation while its
+/// children parse, so up to [`MAX_DEPTH`] of them are live at once. 128 nested
+/// headers over a 121 KB input reached 351 MB, roughly 3000x the input.
+///
+/// Capping the initial reservation bounds the total to
+/// `MAX_DEPTH * PREALLOC_CAP * size_of::<Frame>()` regardless of input. Larger
+/// collections simply grow, which is amortized O(1), and replies smaller than
+/// this still reserve exactly once.
+const PREALLOC_CAP: usize = 64;
+
 /// Maximum aggregate nesting depth accepted by the parser.
 ///
 /// Arrays, sets, pushes, maps, and attributes are parsed recursively, one stack
@@ -1097,7 +1110,9 @@ fn bounded_capacity(
     frames_per_element: usize,
 ) -> usize {
     let remaining = buf.len().saturating_sub(after_crlf);
-    count.min(remaining / (frames_per_element * MIN_FRAME_SIZE))
+    count
+        .min(remaining / (frames_per_element * MIN_FRAME_SIZE))
+        .min(PREALLOC_CAP)
 }
 
 /// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.

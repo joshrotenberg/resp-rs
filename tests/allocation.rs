@@ -105,6 +105,59 @@ fn resp3_pair_headers_reserve_nothing() {
     }
 }
 
+/// `depth` nested collection headers, each claiming `count` elements, followed
+/// by `pad` bytes so every level sees a large remaining-byte budget.
+fn nested_headers(depth: usize, count: usize, pad: usize) -> Bytes {
+    let header = format!("*{count}\r\n");
+    let mut wire = String::with_capacity(depth * header.len() + pad);
+    for _ in 0..depth {
+        wire.push_str(&header);
+    }
+    wire.extend(core::iter::repeat_n('x', pad));
+    Bytes::from(wire)
+}
+
+#[test]
+fn nested_headers_do_not_multiply_the_reservation() {
+    // Clamping to the remaining bytes is per level, and each enclosing
+    // collection holds its reservation while its children parse. Without a cap
+    // on the initial reservation, MAX_DEPTH of those clamps are live at once:
+    // this input reached 351 MB, about 3000x its own size.
+    let wire = nested_headers(128, 40_000, 120_000);
+    let len = wire.len();
+    let peak = peak_alloc(|| {
+        let r = resp3::parse_frame(wire);
+        assert_eq!(r, Err(ParseError::InvalidTag(b'x')));
+    });
+    assert!(
+        peak < 2 * BUDGET,
+        "reserved {peak} bytes for a {len}-byte input ({}x)",
+        peak / len
+    );
+}
+
+#[test]
+fn nested_header_reservation_is_independent_of_input_size() {
+    // The bound is MAX_DEPTH * PREALLOC_CAP * size_of::<Frame>(), a constant.
+    // Growing the input must not grow the reservation. Build the inputs outside
+    // the measurement so only the parse is counted.
+    //
+    // The count has to be large enough that the remaining-bytes clamp is what
+    // binds, not the count itself, or padding cannot move the reservation and
+    // the test would pass whether or not the cap exists.
+    let small_wire = nested_headers(128, 10_000_000, 30_000);
+    let large_wire = nested_headers(128, 10_000_000, 120_000);
+
+    let small = peak_alloc(|| resp3::parse_frame(small_wire.clone()));
+    let large = peak_alloc(|| resp3::parse_frame(large_wire.clone()));
+
+    // Bytes::clone is a refcount bump, so neither closure allocates the input.
+    assert!(
+        large <= small + BUDGET / 16,
+        "8x the input grew the reservation from {small} to {large} bytes"
+    );
+}
+
 #[test]
 fn allocation_tracks_input_not_claimed_count() {
     // Same claimed count, one byte of payload apart: allocation must not jump.
