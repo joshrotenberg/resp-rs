@@ -9,28 +9,51 @@
 //! thresholds are far outside the range of any measurement noise.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use bytes::Bytes;
 use resp_rs::{ParseError, resp2, resp3};
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+// Counters are per thread, not per process. The test harness runs each test on
+// its own thread, so this attributes every allocation to the test that made it.
+//
+// A process-wide counter cannot work here even under a mutex: a mutex only
+// serialises the tests that take it, while sibling tests allocate on other
+// threads throughout, and those allocations land in whatever measurement
+// happens to be open. That produced a roughly 1-in-12 flake.
+//
+// `const` initialisation matters: it keeps this allocation-free, so observing
+// an allocation cannot itself allocate and recurse. `Cell<usize>` has no
+// destructor, so there is no TLS teardown ordering to worry about, and
+// `try_with` degrades to not counting rather than panicking if it is ever
+// reached during teardown.
+thread_local! {
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Tracking;
 
-// SAFETY: every method forwards to the system allocator unchanged; the atomics
+// SAFETY: every method forwards to the system allocator unchanged; the counters
 // only observe sizes and never affect the pointers handed back.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
-        PEAK.fetch_max(live, Ordering::SeqCst);
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + layout.size();
+            live.set(now);
+            let _ = PEAK.try_with(|peak| {
+                if now > peak.get() {
+                    peak.set(now);
+                }
+            });
+        });
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+        // Saturating: a buffer allocated on another thread and dropped on this
+        // one would otherwise underflow.
+        let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -38,19 +61,12 @@ unsafe impl GlobalAlloc for Tracking {
 #[global_allocator]
 static ALLOCATOR: Tracking = Tracking;
 
-/// Serialises measurement so tests running in parallel cannot pollute the
-/// counters for one another.
-static MEASURING: Mutex<()> = Mutex::new(());
-
-/// Peak bytes allocated while `f` runs.
+/// Peak bytes allocated on this thread while `f` runs.
 fn peak_alloc<T>(f: impl FnOnce() -> T) -> usize {
-    let _guard = MEASURING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let before = LIVE.load(Ordering::SeqCst);
-    PEAK.store(before, Ordering::SeqCst);
+    let before = LIVE.with(|live| live.get());
+    PEAK.with(|peak| peak.set(before));
     let value = f();
-    let peak = PEAK.load(Ordering::SeqCst);
+    let peak = PEAK.with(|peak| peak.get());
     drop(value);
     peak.saturating_sub(before)
 }
