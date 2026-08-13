@@ -65,6 +65,26 @@ const PREALLOC_CAP: usize = 128;
 /// reachable by real traffic.
 pub const MAX_DEPTH: u32 = 128;
 
+/// Maximum length of a single CRLF-terminated line.
+///
+/// Line-based prefixes are scanned forward for `\r\n`. Without a ceiling a peer
+/// that sends a tag and never sends the terminator holds the parser in
+/// `Incomplete` forever: [`Parser`] keeps buffering, and because it re-parses
+/// from offset 0 on every call, the rescan cost is quadratic in what has
+/// arrived. Neither existing limit applies, because `MAX_COLLECTION_SIZE` and
+/// `MAX_BULK_STRING_SIZE` bound counts and lengths that are only read once the
+/// line has terminated.
+///
+/// A line past this limit is rejected with [`ParseError::LineTooLong`], which is
+/// a hard error, so [`Parser`] drops the buffer rather than waiting for data
+/// that cannot help.
+///
+/// 64 KiB matches Redis's own `PROTO_INLINE_MAX_SIZE`. Every line-based type
+/// here is a status string, an error message, or a run of digits, so real
+/// traffic is orders of magnitude below it; large payloads travel as bulk
+/// strings, whose body is length-prefixed and not scanned for CRLF.
+pub const MAX_LINE_LENGTH: usize = 64 * 1024;
+
 /// A streaming parser for RESP3 frames.
 ///
 /// This parser allows feeding data in chunks and extracting frames as they become available.
@@ -1089,13 +1109,24 @@ pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseErr
 /// `line_end` is the position of `\r` and `after_crlf` is the position after `\n`.
 #[inline]
 fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
-    let mut i = from;
     let len = buf.len();
+    let mut i = from;
     while i + 1 < len {
         if buf[i] == b'\r' && buf[i + 1] == b'\n' {
             return Ok((i, i + 2));
         }
         i += 1;
+    }
+    // Only reached when the whole buffer held no CRLF, so the length check
+    // costs nothing on the success path. Bounding the scan itself instead
+    // measured 2 to 4 percent slower on RESP2 array parsing, for a limit that
+    // only ever matters when a frame does not terminate.
+    if len - from > MAX_LINE_LENGTH {
+        // The line already exceeds the ceiling, so no CRLF that arrives later
+        // could bring it back into range. Reporting that rather than
+        // `Incomplete` is what lets `Parser` drop the buffer instead of growing
+        // it for as long as the peer keeps sending.
+        return Err(ParseError::LineTooLong);
     }
     Err(ParseError::Incomplete)
 }

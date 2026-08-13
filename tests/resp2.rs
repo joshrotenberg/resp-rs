@@ -466,3 +466,73 @@ fn lengths_and_counts_still_reject_a_plus() {
         Err(ParseError::BadLength)
     );
 }
+
+// --- Line length ceiling (issue #63) ---
+
+#[test]
+fn unterminated_line_is_rejected_not_buffered_forever() {
+    // Every line-based prefix. Without a ceiling these all returned Incomplete,
+    // which Parser reads as "need more data", so the peer could grow the buffer
+    // without bound.
+    for tag in ["+", "-", ":", "$", "*"] {
+        let mut wire = tag.to_string();
+        wire.push_str(&"x".repeat(resp2::MAX_LINE_LENGTH + 1));
+        assert_eq!(
+            resp2::parse_frame(Bytes::from(wire)),
+            Err(ParseError::LineTooLong),
+            "tag {tag}"
+        );
+    }
+}
+
+#[test]
+fn a_line_at_the_limit_still_parses() {
+    // The ceiling must not reject anything a peer could legitimately send just
+    // under it.
+    let mut wire = String::from("+");
+    wire.push_str(&"y".repeat(resp2::MAX_LINE_LENGTH));
+    wire.push_str("\r\n");
+    let (frame, rest) = resp2::parse_frame(Bytes::from(wire)).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(frame.as_bytes().unwrap().len(), resp2::MAX_LINE_LENGTH);
+}
+
+#[test]
+fn a_short_unterminated_line_is_still_incomplete() {
+    // Under the ceiling, "not yet" must still be reported as Incomplete so
+    // streaming works.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"+partial")),
+        Err(ParseError::Incomplete)
+    );
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"+partial\r")),
+        Err(ParseError::Incomplete)
+    );
+}
+
+#[test]
+fn parser_stops_buffering_an_unterminated_line() {
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::from_static(b"+"));
+
+    let mut fed = 1usize;
+    for _ in 0..64 {
+        parser.feed(Bytes::from(vec![b'x'; 8192]));
+        fed += 8192;
+        match parser.next_frame() {
+            Ok(None) => continue,
+            Err(ParseError::LineTooLong) => {
+                // Hard error, so the buffer is dropped rather than retained.
+                assert_eq!(parser.buffered_bytes(), 0);
+                assert!(
+                    fed < resp2::MAX_LINE_LENGTH * 2,
+                    "kept buffering to {fed} bytes"
+                );
+                return;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    panic!("parser never stopped buffering");
+}
