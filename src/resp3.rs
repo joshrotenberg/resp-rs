@@ -604,6 +604,7 @@ fn parse_collection(
         };
     }
     let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
+    check_count_fits(buf, after_crlf, count, 1)?;
     let mut cursor = after_crlf;
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
@@ -638,6 +639,8 @@ fn parse_pairs(
         };
     }
     let count = parse_count(len_bytes)?;
+    // Each element is a key and a value, so it needs twice the wire budget.
+    check_count_fits(buf, after_crlf, count, 2)?;
     let mut cursor = after_crlf;
     let mut pairs = Vec::with_capacity(count);
     if count > 0 {
@@ -1066,6 +1069,39 @@ fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
         v = v * 10 + digit;
     }
     if neg { Ok(-v) } else { Ok(v) }
+}
+
+/// Smallest number of bytes a frame can occupy on the wire: a tag byte then
+/// CRLF, as in `_\r\n` for a null.
+const MIN_FRAME_SIZE: usize = 3;
+
+/// Reject a collection whose element count cannot fit in the bytes that remain.
+///
+/// The count is taken straight off the wire, so reserving capacity for it
+/// before reading any elements lets an 11-byte header reserve over a gigabyte.
+/// Input that could legitimately be complete already carries at least
+/// `MIN_FRAME_SIZE` bytes per frame, so this rejects only what cannot possibly
+/// be complete and leaves reservation exact for everything else.
+///
+/// `frames_per_element` is 1 for arrays, sets, and pushes, and 2 for maps and
+/// attributes, whose elements are key/value pairs.
+///
+/// `Incomplete` rather than `BadLength` keeps streaming working: `Parser`
+/// buffers more data and retries, so a genuinely large collection parses once
+/// its bytes arrive. This matches how a bulk string already handles a declared
+/// length longer than the buffer.
+#[inline]
+fn check_count_fits(
+    buf: &[u8],
+    after_crlf: usize,
+    count: usize,
+    frames_per_element: usize,
+) -> Result<(), ParseError> {
+    let remaining = buf.len().saturating_sub(after_crlf);
+    if count.saturating_mul(frames_per_element * MIN_FRAME_SIZE) > remaining {
+        return Err(ParseError::Incomplete);
+    }
+    Ok(())
 }
 
 /// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.

@@ -232,6 +232,7 @@ pub(crate) fn parse_frame_inner(
                 return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
             let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
+            check_count_fits(buf, after_crlf, count)?;
             let mut cursor = after_crlf;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
@@ -428,6 +429,31 @@ fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
             .ok_or(ParseError::BadLength)?;
     }
     Ok(v)
+}
+
+/// Smallest number of bytes a frame can occupy on the wire: a tag byte then
+/// CRLF, as in `+\r\n` for an empty simple string.
+const MIN_FRAME_SIZE: usize = 3;
+
+/// Reject a collection whose element count cannot fit in the bytes that remain.
+///
+/// The count is taken straight off the wire, so reserving capacity for it
+/// before reading any elements lets an 11-byte header reserve hundreds of
+/// megabytes. Input that could legitimately be complete already carries at
+/// least `MIN_FRAME_SIZE` bytes per element, so this rejects only what cannot
+/// possibly be complete and leaves reservation exact for everything else.
+///
+/// `Incomplete` rather than `BadLength` keeps streaming working: `Parser`
+/// buffers more data and retries, so a genuinely large collection parses once
+/// its bytes arrive. This matches how a bulk string already handles a declared
+/// length longer than the buffer.
+#[inline]
+fn check_count_fits(buf: &[u8], after_crlf: usize, count: usize) -> Result<(), ParseError> {
+    let remaining = buf.len().saturating_sub(after_crlf);
+    if count.saturating_mul(MIN_FRAME_SIZE) > remaining {
+        return Err(ParseError::Incomplete);
+    }
+    Ok(())
 }
 
 /// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.
