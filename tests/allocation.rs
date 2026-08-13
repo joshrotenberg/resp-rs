@@ -165,6 +165,103 @@ fn genuinely_truncated_collection_still_reports_incomplete() {
     );
 }
 
+// --- An oversized count must not mask a definite protocol error ---
+//
+// Bounding the reservation must not decide the outcome. If the bytes already
+// present contain something that can never be valid, no amount of further data
+// changes that, so the parse has to fail rather than report Incomplete. Getting
+// this wrong turns fail-fast into never-fail: `Parser` treats Incomplete as
+// "need more data" and would buffer from a peer forever without ever having
+// grounds to drop the connection.
+
+#[test]
+fn oversized_count_still_reports_an_invalid_tag() {
+    // `<` is not a type tag in either protocol, and the count is far larger
+    // than the remaining bytes could hold.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"*9999999\r\n<garbage\r\n")),
+        Err(ParseError::InvalidTag(b'<'))
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"~9999999\r\n<garbage\r\n")),
+        Err(ParseError::InvalidTag(b'<'))
+    );
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"%9999999\r\n<garbage\r\n")),
+        Err(ParseError::InvalidTag(b'<'))
+    );
+}
+
+#[test]
+fn oversized_count_matches_small_count_on_malformed_input() {
+    // The count must not change the diagnosis. These pairs differ only in the
+    // declared count, so they must produce the same error.
+    let cases: &[(&[u8], &[u8])] = &[
+        (b"~1\r\n<garbage\r\n", b"~9999999\r\n<garbage\r\n"),
+        (b"*1\r\n<garbage\r\n", b"*9999999\r\n<garbage\r\n"),
+        (b"%1\r\n<garbage\r\n", b"%9999999\r\n<garbage\r\n"),
+    ];
+    for (small, large) in cases {
+        let small_result = resp3::parse_frame(Bytes::copy_from_slice(small));
+        let large_result = resp3::parse_frame(Bytes::copy_from_slice(large));
+        assert_eq!(
+            small_result,
+            large_result,
+            "{:?} and {:?} diverged",
+            String::from_utf8_lossy(small),
+            String::from_utf8_lossy(large)
+        );
+    }
+}
+
+#[test]
+fn parser_terminates_on_oversized_count_with_invalid_tag() {
+    // Regression guard: a peer sends a header claiming millions of elements
+    // followed by one invalid byte, then keeps sending. The parser must error
+    // rather than buffer without bound.
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::from_static(b"~9999999\r\n"));
+    parser.feed(Bytes::from_static(b"<garbage\r\n"));
+    assert_eq!(parser.next_frame(), Err(ParseError::InvalidTag(b'<')));
+}
+
+#[test]
+fn differential_fuzzer_divergences() {
+    // Inputs from the resp-zig differential fuzzer that reported Incomplete
+    // when the Zig port reported a definite error.
+    let cases: &[(&[u8], ParseError)] = &[
+        (b"~3\r\nab\xe9\r\n", ParseError::InvalidTag(b'a')),
+        (b"%4\r\nabc:\r\n", ParseError::InvalidTag(b'a')),
+    ];
+    for (wire, expected) in cases {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(expected.clone()),
+            "{:?}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+
+    // Nested case: the inner map's count outruns the buffer, and `<` inside it
+    // is not a valid tag.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(
+            b"*2\r\n%8\r\n+k\r\n<1\r\n#t\r\n\x945\r\n"
+        )),
+        Err(ParseError::InvalidTag(b'<'))
+    );
+}
+
+#[test]
+fn oversized_count_with_valid_prefix_still_reports_incomplete() {
+    // The other side of the same coin: when the bytes present are valid as far
+    // as they go, Incomplete is still the right answer and streaming works.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"~9999999\r\n:1\r\n:2\r\n")),
+        Err(ParseError::Incomplete)
+    );
+}
+
 // --- Streaming must still assemble across feeds ---
 
 #[test]

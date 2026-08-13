@@ -232,9 +232,8 @@ pub(crate) fn parse_frame_inner(
                 return Ok((Frame::Array(Some(Vec::new())), after_crlf));
             }
             let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
-            check_count_fits(buf, after_crlf, count)?;
             let mut cursor = after_crlf;
-            let mut items = Vec::with_capacity(count);
+            let mut items = Vec::with_capacity(bounded_capacity(buf, after_crlf, count));
             for _ in 0..count {
                 let (item, next) = parse_frame_inner(input, cursor, child_depth)?;
                 items.push(item);
@@ -435,25 +434,23 @@ fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
 /// CRLF, as in `+\r\n` for an empty simple string.
 const MIN_FRAME_SIZE: usize = 3;
 
-/// Reject a collection whose element count cannot fit in the bytes that remain.
+/// Capacity to reserve for a collection of `count` elements.
 ///
-/// The count is taken straight off the wire, so reserving capacity for it
-/// before reading any elements lets an 11-byte header reserve hundreds of
-/// megabytes. Input that could legitimately be complete already carries at
-/// least `MIN_FRAME_SIZE` bytes per element, so this rejects only what cannot
-/// possibly be complete and leaves reservation exact for everything else.
+/// The count is taken straight off the wire, so reserving it directly lets an
+/// 11-byte header reserve hundreds of megabytes. Clamping it to what the
+/// remaining bytes could actually hold, at `MIN_FRAME_SIZE` per frame, keeps
+/// the reservation proportional to the input.
 ///
-/// `Incomplete` rather than `BadLength` keeps streaming working: `Parser`
-/// buffers more data and retries, so a genuinely large collection parses once
-/// its bytes arrive. This matches how a bulk string already handles a declared
-/// length longer than the buffer.
+/// This clamps only the reservation, never the outcome. Parsing still runs and
+/// reports whatever it finds, so input that is both oversized and malformed
+/// still fails on the malformed byte instead of being reported as `Incomplete`
+/// forever. Complete input is unaffected: it carries at least `MIN_FRAME_SIZE`
+/// bytes per frame, so the clamp never falls below `count` and the reservation
+/// stays exact.
 #[inline]
-fn check_count_fits(buf: &[u8], after_crlf: usize, count: usize) -> Result<(), ParseError> {
+fn bounded_capacity(buf: &[u8], after_crlf: usize, count: usize) -> usize {
     let remaining = buf.len().saturating_sub(after_crlf);
-    if count.saturating_mul(MIN_FRAME_SIZE) > remaining {
-        return Err(ParseError::Incomplete);
-    }
-    Ok(())
+    count.min(remaining / MIN_FRAME_SIZE)
 }
 
 /// Parse a collection count (usize) with MAX_COLLECTION_SIZE check.
