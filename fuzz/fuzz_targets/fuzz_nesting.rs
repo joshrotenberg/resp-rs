@@ -34,21 +34,25 @@ fuzz_target!(|data: &[u8]| {
         Err(e) => panic!("resp2 depth {depth}: unexpected error {e:?}"),
     }
 
-    // RESP3: five tags recurse. Maps and attributes need a key before the
-    // nested value, so their repeat unit carries one.
+    // RESP3 tags that nest through a repeatable unit. Maps need a key before
+    // the nested value, so their unit carries one.
+    //
+    // `|` is not here. An attribute carries metadata for the frame that follows
+    // and is skipped where a frame is expected (issue #59), so a chain of
+    // attributes never reaches a real frame and is not well-formed input. The
+    // attribute depth path is parse_pairs, which `%` already exercises.
     let mut wire = String::new();
     for i in 0..depth {
         let tag = if tags.is_empty() {
             0
         } else {
-            tags[i % tags.len()] % 5
+            tags[i % tags.len()] % 4
         };
         wire.push_str(match tag {
             0 => "*1\r\n",
             1 => "~1\r\n",
             2 => ">1\r\n",
-            3 => "%1\r\n+k\r\n",
-            _ => "|1\r\n+k\r\n",
+            _ => "%1\r\n+k\r\n",
         });
     }
     wire.push_str(":1\r\n");
