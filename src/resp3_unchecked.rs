@@ -46,6 +46,28 @@ unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
     if neg { -v } else { v }
 }
 
+/// Read one aggregate element, skipping any attributes that precede it.
+///
+/// Mirrors `resp3::parse_element`. An attribute is metadata for the frame that
+/// follows and does not occupy an element slot, so the two parsers must agree
+/// on this or the equivalence property between them breaks.
+///
+/// # Safety
+///
+/// Same contract as [`parse_inner`]: `input` holds valid, complete RESP3 from
+/// `pos`, which guarantees a non-attribute frame eventually follows.
+#[inline(always)]
+unsafe fn parse_element(input: &Bytes, pos: usize) -> (Frame, usize) {
+    let mut cursor = pos;
+    loop {
+        let (frame, next) = parse_inner(input, cursor);
+        cursor = next;
+        if !matches!(frame, Frame::Attribute(_)) {
+            return (frame, cursor);
+        }
+    }
+}
+
 unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
     let buf = input.as_ref();
     let tag = *buf.get_unchecked(pos);
@@ -143,7 +165,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let mut cursor = cr + 2;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (frame, next) = parse_inner(input, cursor);
+                let (frame, next) = parse_element(input, cursor);
                 items.push(frame);
                 cursor = next;
             }
@@ -159,7 +181,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let mut cursor = cr + 2;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (frame, next) = parse_inner(input, cursor);
+                let (frame, next) = parse_element(input, cursor);
                 items.push(frame);
                 cursor = next;
             }
@@ -179,8 +201,8 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let mut cursor = cr + 2;
             let mut pairs = Vec::with_capacity(count);
             for _ in 0..count {
-                let (key, next1) = parse_inner(input, cursor);
-                let (val, next2) = parse_inner(input, next1);
+                let (key, next1) = parse_element(input, cursor);
+                let (val, next2) = parse_element(input, next1);
                 pairs.push((key, val));
                 cursor = next2;
             }
@@ -200,7 +222,7 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let mut cursor = cr + 2;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                let (frame, next) = parse_inner(input, cursor);
+                let (frame, next) = parse_element(input, cursor);
                 items.push(frame);
                 cursor = next;
             }

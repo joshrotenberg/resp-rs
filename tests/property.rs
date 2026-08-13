@@ -67,7 +67,14 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
             }),
     ];
 
-    leaf.prop_recursive(
+    // Attribute is deliberately absent from the recursive branch. An attribute
+    // carries metadata for the frame that follows and does not occupy an
+    // element slot, so the parser skips it inside an aggregate (issue #59).
+    // A Frame::Attribute sitting in an aggregate's Vec is therefore not a
+    // structure the parser can produce, and serializing one emits wire bytes
+    // that mean something different on the way back. Generating it here would
+    // assert a roundtrip that is not claimed.
+    let nested = leaf.prop_recursive(
         3,  // max depth
         64, // max nodes
         6,  // items per collection
@@ -79,14 +86,18 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Frame::Set),
                 // Map
                 prop::collection::vec((inner.clone(), inner.clone()), 0..4).prop_map(Frame::Map),
-                // Attribute
-                prop::collection::vec((inner.clone(), inner.clone()), 0..4)
-                    .prop_map(Frame::Attribute),
                 // Push
                 prop::collection::vec(inner, 0..6).prop_map(Frame::Push),
             ]
         },
-    )
+    );
+
+    // Attributes are still covered, in the one position where they round-trip:
+    // standing alone, which is where a real peer sends them.
+    prop_oneof![
+        9 => nested.clone(),
+        1 => prop::collection::vec((nested.clone(), nested), 0..4).prop_map(Frame::Attribute),
+    ]
 }
 
 // ---------------------------------------------------------------------------
