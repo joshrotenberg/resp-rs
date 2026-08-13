@@ -12,18 +12,26 @@ use bytes::Bytes;
 
 use crate::resp2::Frame;
 
-/// Find `\r` in buf starting at `from` using unchecked pointer access.
+/// Find the CRLF terminating a line, starting at `from`, using unchecked
+/// pointer access. Returns the position of the `\r`.
+///
+/// This scans for the `\r\n` pair, not for a bare `\r`. It must agree with the
+/// safe [`crate::resp2::find_crlf`], which treats a lone `\r` inside a payload
+/// as ordinary data. Stopping at the first `\r` would end the line early on
+/// input the safe parser accepts, desynchronizing the cursor and resuming on a
+/// byte that is not a frame tag.
 ///
 /// # Safety
 ///
-/// Caller must ensure `buf[from..]` contains a `\r` byte before the end
-/// of the allocation.
+/// Caller must ensure `buf[from..]` contains a `\r\n` pair before the end of
+/// the allocation.
 #[inline(always)]
 unsafe fn find_cr(buf: &[u8], from: usize) -> usize {
     let ptr = buf.as_ptr();
     let mut i = from;
-    // SAFETY: caller guarantees a \r exists in bounds
-    while *ptr.add(i) != b'\r' {
+    // SAFETY: caller guarantees a CRLF exists in bounds, at some index j with
+    // j + 1 in bounds. The loop only reads i + 1 while i < j, so i + 1 <= j.
+    while !(*ptr.add(i) == b'\r' && *ptr.add(i + 1) == b'\n') {
         i += 1;
     }
     i
@@ -188,6 +196,14 @@ mod tests {
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
             "*2\r\n*1\r\n:1\r\n+OK\r\n",
+            // Bare CR inside a payload is data, not a line terminator. These
+            // desynchronized the unchecked cursor before issue #65: the first
+            // gave a silently wrong result, the second reached
+            // unreachable_unchecked and aborted.
+            "+a\rb\r\n",
+            "-a\rb\r\n",
+            "*2\r\n+a\rZ+b\r\n+x\r\n",
+            "*2\r\n+a\rb\r\n+x\r\n",
         ];
 
         for wire in cases {
