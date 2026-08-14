@@ -536,3 +536,18 @@ fn parser_stops_buffering_an_unterminated_line() {
     }
     panic!("parser never stopped buffering");
 }
+
+#[test]
+fn an_over_long_line_is_rejected_even_when_terminated() {
+    // The ceiling must mean the same thing whether or not the line ends. An
+    // earlier revision only checked the unterminated path, so a complete but
+    // over-long line slipped through and the constant did not mean what its
+    // documentation said.
+    let mut wire = String::from("+");
+    wire.push_str(&"x".repeat(resp2::MAX_LINE_LENGTH + 1));
+    wire.push_str("\r\n");
+    assert_eq!(
+        resp2::parse_frame(Bytes::from(wire)),
+        Err(ParseError::LineTooLong)
+    );
+}

@@ -996,3 +996,22 @@ fn bulk_string_body_is_not_subject_to_the_line_ceiling() {
     assert!(rest.is_empty());
     assert!(matches!(frame, Frame::BulkString(Some(ref b)) if b.len() == body.len()));
 }
+
+#[test]
+fn an_over_long_line_is_rejected_even_when_terminated() {
+    // See the RESP2 counterpart: the ceiling applies to terminated lines too.
+    let mut wire = String::from("+");
+    wire.push_str(&"x".repeat(resp3::MAX_LINE_LENGTH + 1));
+    wire.push_str("\r\n");
+    assert_eq!(
+        resp3::parse_frame(Bytes::from(wire)),
+        Err(ParseError::LineTooLong)
+    );
+
+    // A bulk string body is length-prefixed, not scanned, so it stays exempt.
+    let body = vec![b'z'; resp3::MAX_LINE_LENGTH * 4];
+    let mut wire = format!("${}\r\n", body.len()).into_bytes();
+    wire.extend_from_slice(&body);
+    wire.extend_from_slice(b"\r\n");
+    assert!(resp3::parse_frame(Bytes::from(wire)).is_ok());
+}
