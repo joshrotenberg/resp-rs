@@ -91,14 +91,21 @@ pub const MAX_LINE_LENGTH: usize = 64 * 1024;
 /// It maintains an internal buffer of accumulated data and attempts to parse frames from it.
 #[derive(Default, Debug)]
 pub struct Parser {
-    buffer: BytesMut,
+    /// Frozen unparsed data. Frames slice out of this, so stepping past one is
+    /// a refcount bump rather than a copy of everything after it.
+    buffer: Bytes,
+    /// Data fed since `buffer` was frozen. Merged in on the next read, so a
+    /// feed that delivers many frames is merged once and then drained in
+    /// O(1) steps.
+    pending: BytesMut,
 }
 
 impl Parser {
     /// Creates a new parser with an empty buffer.
     pub fn new() -> Self {
         Self {
-            buffer: BytesMut::new(),
+            buffer: Bytes::new(),
+            pending: BytesMut::new(),
         }
     }
 
@@ -106,7 +113,25 @@ impl Parser {
     ///
     /// The data is appended to the internal buffer.
     pub fn feed(&mut self, data: Bytes) {
-        self.buffer.extend_from_slice(&data);
+        self.pending.extend_from_slice(&data);
+    }
+
+    /// Fold anything fed since the last freeze into `buffer`.
+    ///
+    /// Costs a copy only when data arrives while unparsed bytes remain, which
+    /// is once per socket read rather than once per frame.
+    fn merge_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.buffer = self.pending.split().freeze();
+        } else {
+            let mut merged = BytesMut::with_capacity(self.buffer.len() + self.pending.len());
+            merged.extend_from_slice(&self.buffer);
+            merged.unsplit(self.pending.split());
+            self.buffer = merged.freeze();
+        }
     }
 
     /// Attempts to extract the next complete frame from the buffer.
@@ -115,26 +140,29 @@ impl Parser {
     /// Returns `Ok(Some(frame))` on success, consuming the parsed bytes.
     /// Returns `Err` on protocol errors, clearing the buffer.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, ParseError> {
+        self.merge_pending();
         if self.buffer.is_empty() {
             return Ok(None);
         }
 
-        let bytes = self.buffer.split().freeze();
-
-        match parse_frame_inner(&bytes, 0, MAX_DEPTH) {
+        match parse_frame_inner(&self.buffer, 0, MAX_DEPTH) {
             Ok((frame, consumed)) => {
-                if consumed < bytes.len() {
-                    self.buffer.unsplit(BytesMut::from(&bytes[consumed..]));
+                if consumed == self.buffer.len() {
+                    // Drop the reference outright rather than holding an empty
+                    // slice, so a drained buffer does not pin its allocation.
+                    self.buffer = Bytes::new();
+                } else {
+                    self.buffer = self.buffer.slice(consumed..);
                 }
                 Ok(Some(frame))
             }
-            Err(ParseError::Incomplete) => {
-                self.buffer.unsplit(bytes.into());
-                Ok(None)
-            }
+            Err(ParseError::Incomplete) => Ok(None),
             Err(e) => {
-                // Buffer was emptied by split() above; intentionally not restored
-                // on hard errors so the parser doesn't re-parse corrupt data.
+                // Discard everything on a hard error so the parser does not
+                // re-parse corrupt data. The buffer is no longer emptied as a
+                // side effect of split(), so this is explicit.
+                self.buffer = Bytes::new();
+                self.pending.clear();
                 Err(e)
             }
         }
@@ -142,12 +170,13 @@ impl Parser {
 
     /// Returns the number of bytes currently in the buffer.
     pub fn buffered_bytes(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() + self.pending.len()
     }
 
     /// Clears the internal buffer.
     pub fn clear(&mut self) {
-        self.buffer.clear();
+        self.buffer = Bytes::new();
+        self.pending.clear();
     }
 }
 
