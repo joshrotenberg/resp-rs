@@ -456,7 +456,7 @@ impl Frame {
     }
 }
 
-pub use crate::ParseError;
+pub use crate::{ParseError, SerializeError};
 
 /// Parse a single RESP3 frame from the provided `Bytes`.
 ///
@@ -1235,13 +1235,198 @@ fn parse_count(buf: &[u8]) -> Result<usize, ParseError> {
     Ok(count)
 }
 
-/// Converts a Frame to its RESP3 byte representation.
+/// Converts a Frame to its RESP3 byte representation, without validating it.
 ///
-/// This function serializes a Frame into the corresponding RESP3 protocol bytes.
+/// # Warning
+///
+/// This does not check that `frame` can be represented on the wire, and several
+/// frames cannot. A line payload containing CRLF splits the frame, letting the
+/// remainder be read as further frames, which is a protocol injection vector
+/// wherever untrusted bytes reach a payload. Others change type or are rejected
+/// outright: see [`try_frame_to_bytes`] for the full set.
+///
+/// Prefer [`try_frame_to_bytes`] for anything derived from input you do not
+/// control. The `Codec` encode path (behind the `codec` feature) already uses
+/// the checked path.
 pub fn frame_to_bytes(frame: &Frame) -> Bytes {
     let mut buf = BytesMut::new();
     serialize_frame(frame, &mut buf);
     buf.freeze()
+}
+
+/// Serialize a RESP3 frame to bytes, rejecting frames the wire cannot carry.
+///
+/// Succeeds exactly when the result parses back to an identical frame with
+/// nothing left over:
+///
+/// ```text
+/// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
+/// ```
+///
+/// The rules mirror the parser's acceptance grammar rather than being a
+/// separate list, so tightening a parse arm cannot silently open a gap here.
+/// What that catches, beyond the CRLF case:
+///
+/// | Frame | Unchecked wire | Comes back as |
+/// | --- | --- | --- |
+/// | `BigNumber(b"abc")` | `(abc\r\n` | rejected |
+/// | `SpecialFloat(b"1.5")` | `,1.5\r\n` | `Double(1.5)` |
+/// | `Double(f64::NAN)` | `,NaN\r\n` | `SpecialFloat(b"nan")` |
+/// | `VerbatimString(b"text", _)` | `=6\r\ntext:x\r\n` | rejected |
+/// | `StreamedString` with an empty chunk | mid-stream `;0\r\n` | truncated |
+/// | `Attribute` inside an aggregate | slot skipped | one element short |
+///
+/// # Scope
+///
+/// Grammar validity only. The parse-side resource limits ([`MAX_DEPTH`],
+/// [`MAX_LINE_LENGTH`], and the collection and bulk size caps) also stop a
+/// frame from parsing back, but they bound what a peer may send rather than
+/// what a `Frame` may represent, so they are deliberately not checked here.
+///
+/// # Examples
+///
+/// ```
+/// use bytes::Bytes;
+/// use resp_rs::{SerializeError, resp3::{self, Frame}};
+///
+/// assert!(resp3::try_frame_to_bytes(&Frame::Double(1.5)).is_ok());
+/// assert_eq!(
+///     resp3::try_frame_to_bytes(&Frame::Double(f64::NAN)),
+///     Err(SerializeError::NonFiniteDouble)
+/// );
+/// ```
+pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
+    let mut buf = BytesMut::new();
+    try_serialize_frame(frame, &mut buf)?;
+    Ok(buf.freeze())
+}
+
+/// Reject a line payload that would terminate its own frame.
+///
+/// A bare `\r` is fine: [`find_crlf`] scans for the pair, so a lone `\r` is
+/// ordinary payload and round-trips.
+#[inline]
+fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
+    if payload.windows(2).any(|w| w == b"\r\n") {
+        return Err(SerializeError::LineContainsCrlf);
+    }
+    Ok(())
+}
+
+/// Serialize one aggregate element. An attribute cannot occupy a slot, because
+/// the parser skips it there and the aggregate would come back short.
+#[inline]
+fn try_serialize_element(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
+    if matches!(frame, Frame::Attribute(_)) {
+        return Err(SerializeError::AttributeInAggregate);
+    }
+    try_serialize_frame(frame, buf)
+}
+
+/// Validating counterpart of [`serialize_frame`]. Validation happens inline
+/// during the walk so the checked path stays single-pass.
+fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
+    match frame {
+        Frame::SimpleString(s) => {
+            check_line_payload(s)?;
+            serialize_frame(frame, buf);
+        }
+        Frame::Error(e) => {
+            check_line_payload(e)?;
+            serialize_frame(frame, buf);
+        }
+        Frame::BigNumber(n) => {
+            // parse_frame_inner checks the same grammar via check_big_number.
+            let digits = match n.first() {
+                Some(b'+') | Some(b'-') => &n[1..],
+                _ => &n[..],
+            };
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return Err(SerializeError::InvalidBigNumber);
+            }
+            serialize_frame(frame, buf);
+        }
+        Frame::SpecialFloat(f) => {
+            // parse_double_frame yields SpecialFloat for exactly these three
+            // and normalizes anything else into a Double.
+            if !matches!(f.as_ref(), b"inf" | b"-inf" | b"nan") {
+                return Err(SerializeError::InvalidSpecialFloat);
+            }
+            serialize_frame(frame, buf);
+        }
+        Frame::Double(d) => {
+            // f64::to_string emits "NaN" and "inf" for non-finite values, which
+            // the parser reads back as a SpecialFloat, changing the type.
+            if !d.is_finite() {
+                return Err(SerializeError::NonFiniteDouble);
+            }
+            serialize_frame(frame, buf);
+        }
+        Frame::VerbatimString(format, _) => {
+            // parse_verbatim requires the separator at index 3 exactly.
+            if format.len() != 3 || format.contains(&b':') {
+                return Err(SerializeError::InvalidVerbatimFormat);
+            }
+            serialize_frame(frame, buf);
+        }
+        Frame::StreamedString(chunks) => {
+            // An empty chunk is the end-of-stream marker, so one in the middle
+            // truncates the stream in place.
+            if chunks.iter().any(|c| c.is_empty()) {
+                return Err(SerializeError::EmptyStreamedChunk);
+            }
+            serialize_frame(frame, buf);
+        }
+        Frame::Array(Some(items)) => {
+            buf.put_u8(b'*');
+            write_len(items.len(), buf);
+            for item in items {
+                try_serialize_element(item, buf)?;
+            }
+        }
+        Frame::Set(items) => {
+            buf.put_u8(b'~');
+            write_len(items.len(), buf);
+            for item in items {
+                try_serialize_element(item, buf)?;
+            }
+        }
+        Frame::Push(items) => {
+            buf.put_u8(b'>');
+            write_len(items.len(), buf);
+            for item in items {
+                try_serialize_element(item, buf)?;
+            }
+        }
+        Frame::Map(pairs) => {
+            buf.put_u8(b'%');
+            write_len(pairs.len(), buf);
+            for (k, v) in pairs {
+                try_serialize_element(k, buf)?;
+                try_serialize_element(v, buf)?;
+            }
+        }
+        Frame::Attribute(pairs) => {
+            buf.put_u8(b'|');
+            write_len(pairs.len(), buf);
+            for (k, v) in pairs {
+                try_serialize_element(k, buf)?;
+                try_serialize_element(v, buf)?;
+            }
+        }
+        // Everything else is either length-prefixed, written from a typed
+        // value, or a fixed token, so it cannot misrepresent itself.
+        other => serialize_frame(other, buf),
+    }
+    Ok(())
+}
+
+/// Write a decimal count followed by CRLF.
+#[inline]
+fn write_len(n: usize, buf: &mut BytesMut) {
+    let len = n.to_string();
+    buf.extend_from_slice(len.as_bytes());
+    buf.extend_from_slice(b"\r\n");
 }
 
 fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
