@@ -73,9 +73,9 @@ pub const MAX_DEPTH: u32 = 128;
 /// `MAX_BULK_STRING_SIZE` bound counts and lengths that are only read once the
 /// line has terminated.
 ///
-/// A line past this limit is rejected with [`ParseError::LineTooLong`], which is
-/// a hard error, so [`Parser`] drops the buffer rather than waiting for data
-/// that cannot help.
+/// A line past this limit is rejected with [`ParseError::LineTooLong`] whether or
+/// not it has terminated. That is a hard error, so [`Parser`] drops the buffer
+/// rather than waiting for data that cannot help.
 ///
 /// 64 KiB matches Redis's own `PROTO_INLINE_MAX_SIZE`. Every line-based type
 /// here is a status string, an error message, or a run of digits, so real
@@ -442,17 +442,20 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
     let mut i = from;
     while i + 1 < len {
         if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            // Enforced on the terminated path too, not just the unterminated
+            // one, so the limit means the same thing either way. This is a
+            // single predictable compare; bounding the scan itself instead
+            // measured 2 to 4 percent slower on RESP2 array parsing.
+            if i - from > MAX_LINE_LENGTH {
+                return Err(ParseError::LineTooLong);
+            }
             return Ok((i, i + 2));
         }
         i += 1;
     }
-    // Only reached when the whole buffer held no CRLF, so the length check
-    // costs nothing on the success path. Bounding the scan itself instead
-    // measured 2 to 4 percent slower on RESP2 array parsing, for a limit that
-    // only ever matters when a frame does not terminate.
     if len - from > MAX_LINE_LENGTH {
-        // The line already exceeds the ceiling, so no CRLF that arrives later
-        // could bring it back into range. Reporting that rather than
+        // Already past the ceiling with no terminator, so no CRLF arriving
+        // later could bring it back into range. Reporting that rather than
         // `Incomplete` is what lets `Parser` drop the buffer instead of growing
         // it for as long as the peer keeps sending.
         return Err(ParseError::LineTooLong);
