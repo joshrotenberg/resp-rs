@@ -318,8 +318,11 @@
 //!
 //! [`resp2::parse_frame`] and [`resp3::parse_frame`] parse directly from a [`bytes::Bytes`]
 //! buffer with no overhead. The [`resp2::Parser`] and [`resp3::Parser`] wrappers add
-//! incremental buffering for TCP streams, but have roughly 2x overhead per frame due to
-//! internal `BytesMut` split/unsplit operations.
+//! incremental buffering for TCP streams, which costs roughly 20% per frame.
+//!
+//! That used to be roughly 2x, because draining a frame rebuilt the unconsumed
+//! remainder with a fresh allocation and a full copy. Frames now slice out of a
+//! frozen buffer, so stepping past one is a refcount bump.
 //!
 //! **If you already have a complete buffer** (e.g., a full response read from a socket),
 //! call `parse_frame` directly in a loop rather than going through `Parser`:
@@ -364,7 +367,7 @@
 //! | 3-element array | 43 ns | 82 ns |
 //! | 100-element array | 822 ns | 2.0 us |
 //! | 5-frame pipeline (direct) | 107 ns | 129 ns |
-//! | 5-frame pipeline (Parser) | 242 ns | 286 ns |
+//! | 5-frame pipeline (Parser) | 141 ns | 164 ns |
 //! | Streaming string (2 chunks) | -- | 124 ns |
 //! | Streaming array (5 elements) | -- | 226 ns |
 //!

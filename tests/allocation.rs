@@ -30,6 +30,12 @@ use resp_rs::{ParseError, resp2, resp3};
 thread_local! {
     static LIVE: Cell<usize> = const { Cell::new(0) };
     static PEAK: Cell<usize> = const { Cell::new(0) };
+    /// Cumulative bytes requested, never decremented.
+    ///
+    /// Distinct from PEAK on purpose. Churn that is freed as fast as it is
+    /// allocated leaves PEAK flat, so a quadratic copy loop is invisible to a
+    /// peak measurement and only shows up in the running total.
+    static TOTAL: Cell<usize> = const { Cell::new(0) };
 }
 
 struct Tracking;
@@ -38,6 +44,7 @@ struct Tracking;
 // only observe sizes and never affect the pointers handed back.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = TOTAL.try_with(|total| total.set(total.get() + layout.size()));
         let _ = LIVE.try_with(|live| {
             let now = live.get() + layout.size();
             live.set(now);
@@ -69,6 +76,15 @@ fn peak_alloc<T>(f: impl FnOnce() -> T) -> usize {
     let peak = PEAK.with(|peak| peak.get());
     drop(value);
     peak.saturating_sub(before)
+}
+
+/// Cumulative bytes allocated on this thread while `f` runs.
+fn total_alloc<T>(f: impl FnOnce() -> T) -> usize {
+    let before = TOTAL.with(|t| t.get());
+    let value = f();
+    let after = TOTAL.with(|t| t.get());
+    drop(value);
+    after - before
 }
 
 /// Well clear of the ~0 a bounded parse needs, and far below the 381 MB to
@@ -371,4 +387,98 @@ fn large_collection_parses_once_its_bytes_arrive() {
         resp2::Frame::Array(Some(items)) => assert_eq!(items.len(), count),
         other => panic!("expected array, got {other:?}"),
     }
+}
+
+// --- Draining a pipelined buffer must not copy the tail (issue #61) ---
+
+/// Feed `n` frames in one go, then drain to exhaustion.
+fn drain_pipelined(n: usize) -> (usize, usize) {
+    let wire = Bytes::from("+OK\r\n".repeat(n));
+    let input = wire.len();
+    let mut parser = resp2::Parser::new();
+    let peak = total_alloc(|| {
+        parser.feed(wire);
+        let mut got = 0;
+        while let Ok(Some(_)) = parser.next_frame() {
+            got += 1;
+        }
+        assert_eq!(got, n);
+    });
+    (input, peak)
+}
+
+#[test]
+fn draining_a_pipelined_buffer_is_linear_not_quadratic() {
+    // Every frame used to rebuild the unconsumed remainder with a fresh
+    // allocation and a full copy, so draining K frames copied the tail K times.
+    // 200,000 frames over 1 MB of input allocated 100 GB.
+    let (input, peak) = drain_pipelined(50_000);
+    assert!(
+        peak < input * 4,
+        "drained 50,000 frames from {input} bytes using {peak} bytes ({}x)",
+        peak / input.max(1)
+    );
+}
+
+#[test]
+fn drain_cost_grows_with_input_not_with_input_squared() {
+    // Doubling the frame count must roughly double the allocation, not
+    // quadruple it. Quadratic behaviour showed a 4x step here.
+    let (_, small) = drain_pipelined(25_000);
+    let (_, large) = drain_pipelined(50_000);
+    assert!(
+        large < small * 3,
+        "doubling the input took allocation from {small} to {large} bytes"
+    );
+}
+
+#[test]
+fn a_hard_error_still_discards_everything() {
+    // The buffer used to be emptied as a side effect of split(). It is not any
+    // more, so the discard is explicit and worth pinning.
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::from_static(b"+ok\r\nX bad\r\n+more\r\n"));
+    assert!(parser.next_frame().unwrap().is_some());
+    assert!(parser.next_frame().is_err());
+    assert_eq!(parser.buffered_bytes(), 0);
+    assert_eq!(parser.next_frame().unwrap(), None);
+}
+
+#[test]
+fn buffered_bytes_counts_data_fed_mid_drain() {
+    // Feeds now land in a staging buffer until the next read merges them, so
+    // the accessor has to account for both.
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::from_static(b"+a\r\n+b\r\n"));
+    assert_eq!(parser.buffered_bytes(), 8);
+
+    assert!(parser.next_frame().unwrap().is_some());
+    assert_eq!(parser.buffered_bytes(), 4);
+
+    parser.feed(Bytes::from_static(b"+c\r\n"));
+    assert_eq!(parser.buffered_bytes(), 8);
+
+    assert!(parser.next_frame().unwrap().is_some());
+    assert!(parser.next_frame().unwrap().is_some());
+    assert_eq!(parser.buffered_bytes(), 0);
+    assert_eq!(parser.next_frame().unwrap(), None);
+}
+
+#[test]
+fn feeding_mid_frame_still_assembles() {
+    // A feed arriving while an incomplete frame is buffered must merge, not
+    // replace.
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::from_static(b"$5\r\nhel"));
+    assert_eq!(parser.next_frame().unwrap(), None);
+    parser.feed(Bytes::from_static(b"lo\r\n:7\r\n"));
+    assert_eq!(
+        parser.next_frame().unwrap().unwrap(),
+        resp3::Frame::BulkString(Some(Bytes::from_static(b"hello")))
+    );
+    assert_eq!(
+        parser.next_frame().unwrap().unwrap(),
+        resp3::Frame::Integer(7)
+    );
+    assert_eq!(parser.next_frame().unwrap(), None);
 }

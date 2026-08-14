@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc efe3f1bd50d24e4386c6ccfde9db9d1187aadb3157483db6bd9958a14f30e85f # shrinks to frame = BigNumber(b"abc")
-cc 546c43167b03d48c5c02ba722846d75cdf32c3bb020796f7f8a3f309c4b6d05f # shrinks to frame = Push([Map([(SimpleString(b""), SimpleString(b"\r"))])])
