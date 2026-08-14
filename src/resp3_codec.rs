@@ -1,6 +1,6 @@
 //! Tokio codec for RESP3 frame encoding and decoding.
 
-use bytes::{Buf, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::codec::CodecError;
@@ -40,13 +40,40 @@ use crate::resp3::{Frame, MAX_DEPTH, parse_frame_inner, try_frame_to_bytes};
 /// ```
 #[derive(Debug, Default)]
 pub struct Codec {
-    _private: (),
+    /// Frozen unparsed bytes drained out of the read buffer.
+    ///
+    /// Frames slice out of this, so stepping past one is a refcount bump. The
+    /// previous shape cloned the whole read buffer on every `decode` call, and
+    /// tokio-util calls `decode` once per frame while the buffer stays
+    /// readable, so draining K pipelined frames copied about K*N/2 bytes.
+    pending: Bytes,
 }
 
 impl Codec {
     /// Create a new RESP3 codec.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            pending: Bytes::new(),
+        }
+    }
+
+    /// Move anything new in the read buffer into `pending`.
+    ///
+    /// `BytesMut::split` and `freeze` are both O(1), so the common case of an
+    /// empty `pending` costs nothing. A copy happens only when bytes arrive
+    /// while an incomplete frame is held, which is once per socket read.
+    fn take_from(&mut self, src: &mut BytesMut) {
+        if src.is_empty() {
+            return;
+        }
+        if self.pending.is_empty() {
+            self.pending = src.split().freeze();
+        } else {
+            let mut merged = BytesMut::with_capacity(self.pending.len() + src.len());
+            merged.extend_from_slice(&self.pending);
+            merged.unsplit(src.split());
+            self.pending = merged.freeze();
+        }
     }
 }
 
@@ -55,19 +82,42 @@ impl Decoder for Codec {
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() {
+        self.take_from(src);
+        if self.pending.is_empty() {
             return Ok(None);
         }
 
-        let frozen = src.clone().freeze();
-
-        match parse_frame_inner(&frozen, 0, MAX_DEPTH) {
+        match parse_frame_inner(&self.pending, 0, MAX_DEPTH) {
             Ok((frame, consumed)) => {
-                src.advance(consumed);
+                self.pending = if consumed == self.pending.len() {
+                    // Drop the reference rather than holding an empty slice, so
+                    // a drained buffer does not pin its allocation.
+                    Bytes::new()
+                } else {
+                    self.pending.slice(consumed..)
+                };
                 Ok(Some(frame))
             }
             Err(crate::ParseError::Incomplete) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                self.pending = Bytes::new();
+                Err(e.into())
+            }
+        }
+    }
+
+    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // The default implementation decides based on whether `src` is empty,
+        // which is now always true because `decode` drains it. Without this
+        // override a trailing partial frame would be dropped silently instead
+        // of reported as an unexpected EOF.
+        match self.decode(src)? {
+            Some(frame) => Ok(Some(frame)),
+            None if self.pending.is_empty() => Ok(None),
+            None => Err(CodecError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "bytes remaining on stream",
+            ))),
         }
     }
 }
@@ -106,7 +156,42 @@ mod tests {
         let mut codec = Codec::new();
         let mut buf = BytesMut::from("$5\r\nhel");
         assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(buf.as_ref(), b"$5\r\nhel");
+
+        // The partial frame is now held by the codec rather than left in the
+        // read buffer, which is what lets decode avoid cloning the buffer on
+        // every call. The observable contract is unchanged: feeding the rest
+        // completes the frame.
+        assert!(buf.is_empty());
+        buf.extend_from_slice(b"lo\r\n");
+        assert_eq!(
+            codec.decode(&mut buf).unwrap().unwrap(),
+            Frame::BulkString(Some(Bytes::from("hello")))
+        );
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_eof_reports_a_trailing_partial_frame() {
+        // decode drains src, so the default decode_eof would see an empty
+        // buffer and silently drop a partial frame. The override checks the
+        // codec's own pending bytes instead.
+        let mut codec = Codec::new();
+        let mut buf = BytesMut::from("$5\r\nhel");
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+
+        let err = codec.decode_eof(&mut buf).unwrap_err();
+        assert!(
+            matches!(&err, CodecError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_eof_on_a_clean_boundary_is_none() {
+        let mut codec = Codec::new();
+        let mut buf = BytesMut::from("+OK\r\n");
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert!(codec.decode_eof(&mut buf).unwrap().is_none());
     }
 
     #[test]
