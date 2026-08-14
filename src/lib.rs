@@ -467,3 +467,50 @@ pub enum ParseError {
     #[error("maximum line length exceeded")]
     LineTooLong,
 }
+
+/// Reasons a [`Frame`](resp2::Frame) cannot be represented on the wire.
+///
+/// Returned by [`resp2::try_frame_to_bytes`] and [`resp3::try_frame_to_bytes`].
+/// Each variant corresponds to a way the serializer would otherwise emit bytes
+/// that the parser rejects, or reads back as a different frame.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SerializeError {
+    /// A line-based payload contains a CRLF, which would terminate the frame
+    /// early and let the remainder be read as further frames.
+    ///
+    /// A bare `\r` is fine: the parser scans for the pair, so a lone `\r`
+    /// round-trips as payload.
+    #[error("line payload contains CRLF, which would split the frame")]
+    LineContainsCrlf,
+
+    /// A big number is not an optional sign followed by one or more digits.
+    #[error("big number must be an optional sign followed by digits")]
+    InvalidBigNumber,
+
+    /// A special float is not exactly `inf`, `-inf`, or `nan`.
+    #[error("special float must be exactly inf, -inf, or nan")]
+    InvalidSpecialFloat,
+
+    /// A double is not finite. Non-finite values serialize to spellings the
+    /// parser reads back as a `SpecialFloat`, so they change type on the way
+    /// round.
+    #[error("double must be finite; use SpecialFloat for inf and nan")]
+    NonFiniteDouble,
+
+    /// A verbatim string format tag is not exactly three bytes, or contains a
+    /// colon. The parser requires the separator at index 3 exactly.
+    #[error("verbatim string format must be exactly 3 bytes with no colon")]
+    InvalidVerbatimFormat,
+
+    /// A streamed string contains an empty chunk. An empty chunk is the
+    /// end-of-stream marker, so it would truncate the stream in place.
+    #[error("streamed string chunk is empty, which would terminate the stream")]
+    EmptyStreamedChunk,
+
+    /// An attribute appears where an aggregate element is expected. Attributes
+    /// carry metadata for the frame that follows and do not occupy a slot, so
+    /// the parser skips them and the aggregate comes back one element short.
+    #[error("attribute cannot occupy an aggregate element slot")]
+    AttributeInAggregate,
+}

@@ -4,7 +4,7 @@ use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::codec::CodecError;
-use crate::resp2::{Frame, MAX_DEPTH, frame_to_bytes, parse_frame_inner};
+use crate::resp2::{Frame, MAX_DEPTH, parse_frame_inner, try_frame_to_bytes};
 
 /// A Tokio codec for RESP2 frames.
 ///
@@ -75,7 +75,10 @@ impl Encoder<Frame> for Codec {
     type Error = CodecError;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let bytes = frame_to_bytes(&item);
+        // Checked: a frame that cannot parse back as itself is refused rather
+        // than written to the socket. This is the point where a server emits,
+        // so it is where the CRLF injection path is closed.
+        let bytes = try_frame_to_bytes(&item)?;
         dst.extend_from_slice(&bytes);
         Ok(())
     }
@@ -143,6 +146,28 @@ mod tests {
             result,
             Err(CodecError::Parse(ParseError::InvalidTag(b'X')))
         ));
+    }
+
+    #[test]
+    fn encode_refuses_a_frame_that_would_split_the_stream() {
+        // A server reflecting untrusted input into an error reply is the
+        // realistic injection path. encode must refuse rather than emit.
+        let hostile = "BAD'\r\n+OK\r\n:9999";
+        let reply = Frame::Error(Bytes::from(format!("ERR unknown command '{hostile}")));
+
+        let mut codec = Codec::new();
+        let mut buf = BytesMut::new();
+        let result = codec.encode(reply, &mut buf);
+
+        assert!(
+            matches!(result, Err(CodecError::Serialize(_))),
+            "got {result:?}"
+        );
+        assert!(
+            buf.is_empty(),
+            "refused frame still wrote {} bytes",
+            buf.len()
+        );
     }
 
     #[test]

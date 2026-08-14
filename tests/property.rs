@@ -613,3 +613,124 @@ proptest! {
         prop_assert_eq!(safe_rest, unsafe_rest);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Checked serialization (issue #60)
+// ---------------------------------------------------------------------------
+
+/// Generate frames that are deliberately NOT representable on the wire, one per
+/// rule, so the property is exercised from both sides.
+fn arb_invalid_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
+    use resp_rs::resp3::Frame;
+    prop_oneof![
+        // CRLF inside a line payload splits the frame.
+        Just(Frame::SimpleString(Bytes::from(&b"a\r\nb"[..]))),
+        Just(Frame::Error(Bytes::from(&b"ERR x\r\n+OK"[..]))),
+        // Big numbers are digit-strict since #67.
+        Just(Frame::BigNumber(Bytes::from(&b"abc"[..]))),
+        Just(Frame::BigNumber(Bytes::new())),
+        Just(Frame::BigNumber(Bytes::from(&b"1.5"[..]))),
+        // SpecialFloat is exactly these three spellings; anything else
+        // normalizes to a Double on the way back.
+        Just(Frame::SpecialFloat(Bytes::from(&b"1.5"[..]))),
+        Just(Frame::SpecialFloat(Bytes::from(&b"INF"[..]))),
+        // Non-finite doubles come back as SpecialFloat, changing type.
+        Just(Frame::Double(f64::NAN)),
+        Just(Frame::Double(f64::INFINITY)),
+        Just(Frame::Double(f64::NEG_INFINITY)),
+        // The parser requires the verbatim separator at index 3 exactly.
+        Just(Frame::VerbatimString(
+            Bytes::from(&b"text"[..]),
+            Bytes::from(&b"x"[..])
+        )),
+        Just(Frame::VerbatimString(
+            Bytes::from(&b"ab"[..]),
+            Bytes::from(&b"x"[..])
+        )),
+        Just(Frame::VerbatimString(Bytes::new(), Bytes::from(&b"x"[..]))),
+        Just(Frame::VerbatimString(
+            Bytes::from(&b"a:b"[..]),
+            Bytes::from(&b"x"[..])
+        )),
+        // An empty chunk is the end-of-stream marker.
+        Just(Frame::StreamedString(vec![
+            Bytes::from(&b"a"[..]),
+            Bytes::new(),
+            Bytes::from(&b"b"[..]),
+        ])),
+        // An attribute does not occupy an element slot (#59).
+        Just(Frame::Array(Some(vec![Frame::Attribute(vec![])]))),
+        Just(Frame::Set(vec![Frame::Attribute(vec![])])),
+        Just(Frame::Map(vec![(
+            Frame::Attribute(vec![]),
+            Frame::Integer(1)
+        )])),
+    ]
+}
+
+proptest! {
+    /// The specification: checked serialization succeeds exactly when the bytes
+    /// parse back to an identical frame with nothing left over.
+    ///
+    /// Stated as an iff so it cannot go stale the way a rule list does. A parse
+    /// arm tightening without a matching serializer rule breaks this
+    /// immediately, which is how #67 opened the BigNumber gap unnoticed.
+    #[test]
+    fn resp3_checked_serialization_iff_roundtrip(frame in arb_resp3_frame()) {
+        let round_trips = match resp_rs::resp3::parse_frame(
+            resp_rs::resp3::frame_to_bytes(&frame),
+        ) {
+            Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
+            Err(_) => false,
+        };
+        prop_assert_eq!(
+            resp_rs::resp3::try_frame_to_bytes(&frame).is_ok(),
+            round_trips,
+            "checked serialization disagreed with round trip for {:?}",
+            frame
+        );
+    }
+
+    #[test]
+    fn resp2_checked_serialization_iff_roundtrip(frame in arb_resp2_frame()) {
+        let round_trips = match resp_rs::resp2::parse_frame(
+            resp_rs::resp2::frame_to_bytes(&frame),
+        ) {
+            Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
+            Err(_) => false,
+        };
+        prop_assert_eq!(
+            resp_rs::resp2::try_frame_to_bytes(&frame).is_ok(),
+            round_trips,
+            "checked serialization disagreed with round trip for {:?}",
+            frame
+        );
+    }
+
+    /// Same property from the other side: every frame that is deliberately
+    /// unrepresentable must be refused, and must genuinely fail to round trip.
+    #[test]
+    fn resp3_invalid_frames_are_refused(frame in arb_invalid_resp3_frame()) {
+        let round_trips = match resp_rs::resp3::parse_frame(
+            resp_rs::resp3::frame_to_bytes(&frame),
+        ) {
+            Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
+            Err(_) => false,
+        };
+        prop_assert!(!round_trips, "expected {:?} not to round trip", frame);
+        prop_assert!(
+            resp_rs::resp3::try_frame_to_bytes(&frame).is_err(),
+            "expected {:?} to be refused",
+            frame
+        );
+    }
+
+    /// A checked serialization that succeeds must produce exactly the same
+    /// bytes as the unchecked one, so the two paths cannot drift.
+    #[test]
+    fn resp3_checked_and_unchecked_agree_when_valid(frame in arb_resp3_frame()) {
+        if let Ok(checked) = resp_rs::resp3::try_frame_to_bytes(&frame) {
+            prop_assert_eq!(checked, resp_rs::resp3::frame_to_bytes(&frame));
+        }
+    }
+}

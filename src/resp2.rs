@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::ParseError;
+use crate::{ParseError, SerializeError};
 
 /// Maximum reasonable size for collections to prevent DoS attacks.
 const MAX_COLLECTION_SIZE: usize = 10_000_000;
@@ -295,7 +295,38 @@ mod codec_impl;
 #[cfg(feature = "codec")]
 pub use codec_impl::Codec;
 
-/// Serialize a RESP2 frame to bytes.
+/// Serialize a RESP2 frame to bytes, without validating it.
+///
+/// # Warning
+///
+/// This does not check that `frame` can be represented on the wire, and some
+/// frames cannot. A [`Frame::SimpleString`] or [`Frame::Error`] whose payload
+/// contains a CRLF terminates early here, and the remainder is read by the peer
+/// as further frames.
+///
+/// That is a protocol injection vector wherever untrusted bytes reach a
+/// payload, which is exactly what a server does when it reflects a command name
+/// into an error reply:
+///
+/// ```
+/// use bytes::Bytes;
+/// use resp_rs::resp2::{self, Frame};
+///
+/// let hostile = "BAD'\r\n+OK\r\n:9999";
+/// let reply = Frame::Error(Bytes::from(format!("ERR unknown command '{hostile}")));
+///
+/// // One frame in, three frames out.
+/// let wire = resp2::frame_to_bytes(&reply);
+/// let (_, rest) = resp2::parse_frame(wire).unwrap();
+/// assert!(!rest.is_empty());
+///
+/// // The checked path refuses it.
+/// assert!(resp2::try_frame_to_bytes(&reply).is_err());
+/// ```
+///
+/// Prefer [`try_frame_to_bytes`] for anything derived from input you do not
+/// control. The `Codec` encode path (behind the `codec` feature) already uses
+/// the checked path.
 ///
 /// # Examples
 ///
@@ -310,6 +341,96 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
     let mut buf = BytesMut::new();
     serialize_frame(frame, &mut buf);
     buf.freeze()
+}
+
+/// Serialize a RESP2 frame to bytes, rejecting frames the wire cannot carry.
+///
+/// Succeeds exactly when the result parses back to an identical frame with
+/// nothing left over:
+///
+/// ```text
+/// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
+/// ```
+///
+/// The rules mirror the parser's acceptance grammar rather than being a
+/// separate list, so tightening a parse arm cannot silently open a gap here.
+///
+/// # Scope
+///
+/// Grammar validity only. The parse-side resource limits ([`MAX_DEPTH`],
+/// [`MAX_LINE_LENGTH`], and the collection and bulk size caps) also stop a
+/// frame from parsing back, but they bound what a peer may send rather than
+/// what a `Frame` may represent, so they are deliberately not checked here.
+///
+/// # Examples
+///
+/// ```
+/// use bytes::Bytes;
+/// use resp_rs::{SerializeError, resp2::{self, Frame}};
+///
+/// let ok = Frame::SimpleString(Bytes::from("OK"));
+/// assert_eq!(resp2::try_frame_to_bytes(&ok).unwrap(), Bytes::from("+OK\r\n"));
+///
+/// // A bare CR is payload and round-trips.
+/// let cr = Frame::SimpleString(Bytes::from(&b"a\rb"[..]));
+/// assert!(resp2::try_frame_to_bytes(&cr).is_ok());
+///
+/// // A CRLF would split the frame.
+/// let split = Frame::SimpleString(Bytes::from(&b"a\r\nb"[..]));
+/// assert_eq!(
+///     resp2::try_frame_to_bytes(&split),
+///     Err(SerializeError::LineContainsCrlf)
+/// );
+/// ```
+pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
+    let mut buf = BytesMut::new();
+    try_serialize_frame(frame, &mut buf)?;
+    Ok(buf.freeze())
+}
+
+/// Reject a line payload that would terminate its own frame.
+///
+/// A bare `\r` is fine: [`find_crlf`] scans for the pair, so a lone `\r` is
+/// ordinary payload and round-trips.
+#[inline]
+fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
+    if payload.windows(2).any(|w| w == b"\r\n") {
+        return Err(SerializeError::LineContainsCrlf);
+    }
+    Ok(())
+}
+
+/// Validating counterpart of [`serialize_frame`]. Validation happens inline
+/// during the walk so the checked path stays single-pass.
+fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
+    match frame {
+        Frame::SimpleString(s) => {
+            check_line_payload(s)?;
+            buf.put_u8(b'+');
+            buf.extend_from_slice(s);
+            buf.extend_from_slice(b"\r\n");
+        }
+        Frame::Error(e) => {
+            check_line_payload(e)?;
+            buf.put_u8(b'-');
+            buf.extend_from_slice(e);
+            buf.extend_from_slice(b"\r\n");
+        }
+        // Integers are written from i64, and bulk strings are length-prefixed
+        // and read back by length, so neither can misrepresent itself.
+        Frame::Integer(_) | Frame::BulkString(_) => serialize_frame(frame, buf),
+        Frame::Array(Some(items)) => {
+            buf.put_u8(b'*');
+            let len = items.len().to_string();
+            buf.extend_from_slice(len.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            for item in items {
+                try_serialize_frame(item, buf)?;
+            }
+        }
+        Frame::Array(None) => serialize_frame(frame, buf),
+    }
+    Ok(())
 }
 
 fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
