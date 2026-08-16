@@ -46,8 +46,12 @@ unsafe fn parse_usize_unchecked(buf: &[u8]) -> usize {
 #[inline(always)]
 unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
     let mut i = 0;
-    let neg = *buf.get_unchecked(0) == b'-';
-    if neg {
+    // Both signs, mirroring the safe parser. Missing `+` here does not merely
+    // reject: the byte stays in the digit run and `b'+' - b'0'` wraps, so
+    // `:+0\r\n` decoded as 2510 (issue #77).
+    let first = *buf.get_unchecked(0);
+    let neg = first == b'-';
+    if neg || first == b'+' {
         i = 1;
     }
     let mut v: i64 = 0;
@@ -124,6 +128,20 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             }
             let s = core::str::from_utf8_unchecked(line);
             let v: f64 = s.parse().unwrap_unchecked();
+            // The safe parser canonicalizes any non-finite value to a
+            // SpecialFloat, so spellings the exact-match above misses, such as
+            // `Inf` or `NaN`, still land there. Without this, `,Inf\r\n` gave
+            // SpecialFloat("inf") safely and Double(inf) here.
+            if v.is_infinite() || v.is_nan() {
+                let canonical = if v.is_nan() {
+                    "nan"
+                } else if v.is_sign_negative() {
+                    "-inf"
+                } else {
+                    "inf"
+                };
+                return (Frame::SpecialFloat(Bytes::from(canonical)), cr + 2);
+            }
             (Frame::Double(v), cr + 2)
         }
         b'#' => {
@@ -310,6 +328,20 @@ mod tests {
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
             "~2\r\n+a\r\n+b\r\n",
+            // An explicit plus sign. The safe parser accepted these from #56
+            // while this one still stripped only `-`, leaving `+` in the digit
+            // run where `b'+' - b'0'` wrapped: `:+0\r\n` decoded as 2510
+            // (issue #77).
+            ":+0\r\n",
+            ":+42\r\n",
+            "*2\r\n:+1\r\n:-1\r\n",
+            // Non-canonical spellings of the special floats. The safe parser
+            // canonicalizes any non-finite value to a SpecialFloat, so these
+            // must not come back as Double here.
+            ",Inf\r\n",
+            ",NaN\r\n",
+            ",-Inf\r\n",
+            ",infinity\r\n",
             "%1\r\n+key\r\n:1\r\n",
             "|1\r\n+meta\r\n+val\r\n",
             ">2\r\n+msg\r\n+data\r\n",
