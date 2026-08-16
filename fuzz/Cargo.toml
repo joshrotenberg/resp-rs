@@ -13,9 +13,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 bytes = "1"
+# An oracle the crate cannot agree with by being consistently wrong.
+redis-protocol = { version = "6", features = ["resp2", "resp3", "bytes"] }
 
 [dependencies.resp-rs]
 path = ".."
+# Without this, parse_frame_unchecked is not compiled into any fuzz binary, so
+# the safe-versus-unchecked axis was unreachable from fuzzing.
+features = ["unsafe-internals"]
 
 [[bin]]
 name = "fuzz_resp2_parse"
@@ -83,6 +88,20 @@ bench = false
 [[bin]]
 name = "fuzz_nesting"
 path = "fuzz_targets/fuzz_nesting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp2_differential"
+path = "fuzz_targets/fuzz_resp2_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_unchecked"
+path = "fuzz_targets/fuzz_unchecked.rs"
 test = false
 doc = false
 bench = false

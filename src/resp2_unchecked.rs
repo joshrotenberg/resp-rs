@@ -41,13 +41,17 @@ unsafe fn find_cr(buf: &[u8], from: usize) -> usize {
 ///
 /// # Safety
 ///
-/// Caller must ensure `buf` contains only ASCII digits (optionally preceded
-/// by `-`) and is non-empty.
+/// Caller must ensure `buf` contains only ASCII digits, optionally preceded
+/// by `+` or `-`, and is non-empty.
 #[inline(always)]
 unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
     let mut i = 0;
-    let neg = *buf.get_unchecked(0) == b'-';
-    if neg {
+    // Both signs, mirroring the safe parser. Missing `+` here does not merely
+    // reject: the byte stays in the digit run and `b'+' - b'0'` wraps, so
+    // `:+0\r\n` decoded as 2510 (issue #77).
+    let first = *buf.get_unchecked(0);
+    let neg = first == b'-';
+    if neg || first == b'+' {
         i = 1;
     }
     let mut v: i64 = 0;
@@ -204,6 +208,13 @@ mod tests {
             "-a\rb\r\n",
             "*2\r\n+a\rZ+b\r\n+x\r\n",
             "*2\r\n+a\rb\r\n+x\r\n",
+            // An explicit plus sign. The safe parser accepted these from #56
+            // while this one still stripped only `-`, leaving `+` in the digit
+            // run where `b'+' - b'0'` wrapped: `:+0\r\n` decoded as 2510
+            // (issue #77).
+            ":+0\r\n",
+            ":+42\r\n",
+            "*2\r\n:+1\r\n:-1\r\n",
         ];
 
         for wire in cases {
