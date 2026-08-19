@@ -54,12 +54,20 @@ unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
     if neg || first == b'+' {
         i = 1;
     }
+    // Accumulate negatively. i64::MIN has no positive counterpart, so building
+    // the magnitude first and negating overflows on exactly that value: the
+    // safe parser carries a special case for it, this had none. In release the
+    // two overflows cancel and the answer comes out right by accident, but
+    // under -Cdebug-assertions, which is how cargo-fuzz builds, it panics
+    // inside an unsafe fn that promises not to.
     let mut v: i64 = 0;
     while i < buf.len() {
-        v = v * 10 + (*buf.get_unchecked(i) - b'0') as i64;
+        v = v * 10 - (*buf.get_unchecked(i) - b'0') as i64;
         i += 1;
     }
-    if neg { -v } else { v }
+    // Negative accumulation reaches i64::MIN exactly, and i64::MAX negates
+    // without overflow, so no valid input overflows either branch.
+    if neg { v } else { -v }
 }
 
 /// Parse a usize from ASCII digits without bounds checks.
@@ -214,6 +222,11 @@ mod tests {
             // (issue #77).
             ":+0\r\n",
             ":+42\r\n",
+            // i64::MIN. Building the magnitude positively overflows on exactly
+            // this value; in release the overflows cancel, under
+            // debug-assertions it panicked (found by fuzz_unchecked on main).
+            ":-9223372036854775808\r\n",
+            ":9223372036854775807\r\n",
             "*2\r\n:+1\r\n:-1\r\n",
         ];
 
