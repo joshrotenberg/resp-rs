@@ -169,9 +169,17 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
             let len = parse_usize_unchecked(len_slice);
             let ds = cr + 2;
             let de = ds + len;
-            let format = input.slice(ds..ds + 3);
-            let content = input.slice(ds + 4..de);
-            (Frame::VerbatimString(format, content), de + 2)
+            // One length-delimited slice, structurally identical to the `!`
+            // BlobError arm. The hardcoded 3 and 4 that used to live here were
+            // an unchecked restatement of the safe parser's `sep != 3` rule,
+            // and that duplication is where #65, #77 and the float
+            // canonicalization bug all came from.
+            (
+                Frame::VerbatimString {
+                    payload: input.slice(ds..de),
+                },
+                de + 2,
+            )
         }
         b'!' => {
             let cr = find_cr(buf, pos + 1);
