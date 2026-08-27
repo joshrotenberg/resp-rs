@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-27
+
+### Fixed
+
+- *(unsafe-internals)* Parse i64::MIN without overflowing the accumulator ([#80](https://github.com/joshrotenberg/resp-rs/pull/80))
+
+### Testing
+
+- Add differential and unchecked fuzz targets, and fix the two bugs they found ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- Add a RESP3 differential fuzz target (refs #76) ([#86](https://github.com/joshrotenberg/resp-rs/pull/86))
+
+
+
 ## [0.2.0] - 2026-08-14
 
 ### Fixed
