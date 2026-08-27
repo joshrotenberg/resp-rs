@@ -167,9 +167,11 @@ fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // with the body left over (#83).
         1 => Just(Frame::StreamedString(vec![Bytes::from_static(b"abc")])),
         1 => Just(Frame::StreamedArray(vec![Frame::Integer(1)])),
-        // A payload the parser refuses at this length (#82). Kept just over the
-        // bound so the generator stays cheap.
-        1 => Just(Frame::SimpleString(Bytes::from(vec![b'a'; resp_rs::resp3::MAX_LINE_LENGTH + 1]))),
+        // The over-length case for #82 is deliberately NOT here. It found the
+        // bug, but a 64 KB payload allocated on every generated case is a real
+        // cost, and it shrinks to a 65 KB literal in the regressions file. The
+        // boundary is a fixed constant, so it is pinned by a deterministic test
+        // instead: tests/resp3.rs::line_payload_over_the_ceiling_is_refused.
         // CRLF inside a line payload, which the checked path catches at top
         // level but skipped inside streamed aggregates (#85).
         1 => Just(Frame::SimpleString(Bytes::from_static(b"sp\r\nlit"))),
