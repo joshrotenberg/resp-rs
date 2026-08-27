@@ -25,6 +25,7 @@ jobs:
           - fuzz_resp3_streaming
           - fuzz_nesting
           - fuzz_resp2_differential
+          - fuzz_resp3_differential
           - fuzz_unchecked
     steps:
       - uses: actions/checkout@v6

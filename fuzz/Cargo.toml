@@ -105,3 +105,10 @@ path = "fuzz_targets/fuzz_unchecked.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_resp3_differential"
+path = "fuzz_targets/fuzz_resp3_differential.rs"
+test = false
+doc = false
+bench = false
