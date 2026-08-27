@@ -84,7 +84,14 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
             prop::collection::vec(any::<u8>(), 0..128),
         )
             .prop_map(|(fmt, content)| {
-                Frame::VerbatimString(Bytes::from(fmt), Bytes::from(content))
+                // Payload is stored whole, so the generator assembles
+                // `fmt:content` rather than the two halves.
+                let mut payload = fmt;
+                payload.push(b':');
+                payload.extend_from_slice(&content);
+                Frame::VerbatimString {
+                    payload: Bytes::from(payload),
+                }
             }),
     ];
 
@@ -638,20 +645,25 @@ fn arb_invalid_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         Just(Frame::Double(f64::NAN)),
         Just(Frame::Double(f64::INFINITY)),
         Just(Frame::Double(f64::NEG_INFINITY)),
-        // The parser requires the verbatim separator at index 3 exactly.
-        Just(Frame::VerbatimString(
-            Bytes::from(&b"text"[..]),
-            Bytes::from(&b"x"[..])
-        )),
-        Just(Frame::VerbatimString(
-            Bytes::from(&b"ab"[..]),
-            Bytes::from(&b"x"[..])
-        )),
-        Just(Frame::VerbatimString(Bytes::new(), Bytes::from(&b"x"[..]))),
-        Just(Frame::VerbatimString(
-            Bytes::from(&b"a:b"[..]),
-            Bytes::from(&b"x"[..])
-        )),
+        // The parser requires the verbatim separator at index 3 exactly. The
+        // single-payload representation relabels these rather than removing
+        // them: each is still constructible and still does not round-trip.
+        Just(Frame::VerbatimString {
+            payload: Bytes::from(&b"text:x"[..]),
+        }),
+        Just(Frame::VerbatimString {
+            payload: Bytes::from(&b"ab:x"[..]),
+        }),
+        Just(Frame::VerbatimString {
+            payload: Bytes::from(&b":x"[..]),
+        }),
+        Just(Frame::VerbatimString {
+            payload: Bytes::from(&b"a:b:x"[..]),
+        }),
+        // No separator at all, which the split form could not express.
+        Just(Frame::VerbatimString {
+            payload: Bytes::from(&b"txt"[..]),
+        }),
         // An empty chunk is the end-of-stream marker.
         Just(Frame::StreamedString(vec![
             Bytes::from(&b"a"[..]),

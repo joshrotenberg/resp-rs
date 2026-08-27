@@ -28,10 +28,20 @@ pub fn resp3_to_proto(frame: &resp_rs::resp3::Frame) -> pb::Frame {
         R::BulkString(None) => Kind::BulkString(pb::NullableBytes { data: None }),
         R::BlobError(b) => Kind::BlobError(b.to_vec()),
         R::BigNumber(b) => Kind::BigNumber(b.to_vec()),
-        R::VerbatimString(fmt, content) => Kind::VerbatimString(pb::VerbatimString {
-            format: fmt.to_vec(),
-            content: content.to_vec(),
-        }),
+        R::VerbatimString { payload } => {
+            // The protobuf schema keeps the halves separate. Split at the fixed
+            // offset the protocol guarantees, falling back to the whole payload
+            // as the format when it is malformed, which round-trips it intact.
+            let (fmt, content): (&[u8], &[u8]) = if payload.len() >= 4 && payload[3] == b':' {
+                (&payload[..3], &payload[4..])
+            } else {
+                (&payload[..], &[])
+            };
+            Kind::VerbatimString(pb::VerbatimString {
+                format: fmt.to_vec(),
+                content: content.to_vec(),
+            })
+        }
         R::Array(Some(items)) => Kind::Array(pb::NullableArray {
             items: Some(pb::FrameList {
                 items: items.iter().map(resp3_to_proto).collect(),
@@ -84,10 +94,16 @@ pub fn proto_to_resp3(frame: &pb::Frame) -> resp_rs::resp3::Frame {
         Kind::BulkString(nb) => R::BulkString(nb.data.as_ref().map(|b| Bytes::from(b.clone()))),
         Kind::BlobError(b) => R::BlobError(Bytes::from(b.clone())),
         Kind::BigNumber(b) => R::BigNumber(Bytes::from(b.clone())),
-        Kind::VerbatimString(vs) => R::VerbatimString(
-            Bytes::from(vs.format.clone()),
-            Bytes::from(vs.content.clone()),
-        ),
+        Kind::VerbatimString(vs) => {
+            let mut payload = vs.format.clone();
+            if !vs.content.is_empty() || vs.format.len() == 3 {
+                payload.push(b':');
+                payload.extend_from_slice(&vs.content);
+            }
+            R::VerbatimString {
+                payload: Bytes::from(payload),
+            }
+        }
         Kind::Array(na) => match &na.items {
             Some(list) => R::Array(Some(list.items.iter().map(proto_to_resp3).collect())),
             None => R::Array(None),

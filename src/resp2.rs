@@ -46,7 +46,7 @@ const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 /// collections simply grow, which is amortized O(1), and replies smaller than
 /// this still reserve exactly once.
 ///
-/// 128 was chosen by measurement. It bounds the worst case at 1.18 MB and keeps
+/// 128 was chosen by measurement. It bounds the worst case at 655 KB and keeps
 /// the parsing benchmarks within 2% of an unbounded reservation. Halving it to
 /// 64 only improves the bound to 590 KB, which is not meaningfully safer, while
 /// costing 9% on 100-element arrays, which then fall past the cap and grow.

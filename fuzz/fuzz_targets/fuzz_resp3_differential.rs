@@ -86,7 +86,17 @@ fn norm_ours(f: &resp3::Frame) -> Norm {
         F::SpecialFloat(b) => Norm::Dbl(canon_special(b)),
         F::Boolean(v) => Norm::Bool(*v),
         F::BigNumber(b) => Norm::Big(b.to_vec()),
-        F::VerbatimString(fmt, c) => Norm::Verb(fmt.to_vec(), c.to_vec()),
+        F::VerbatimString { payload } => {
+            // The reference models the halves separately, so split at the fixed
+            // offset the protocol guarantees. A payload without the separator
+            // there is not something the parser produces, but map it whole
+            // rather than panicking.
+            if payload.len() >= 4 && payload[3] == b':' {
+                Norm::Verb(payload[..3].to_vec(), payload[4..].to_vec())
+            } else {
+                Norm::Verb(payload.to_vec(), Vec::new())
+            }
+        }
         F::Array(Some(v)) => Norm::Arr(v.iter().map(norm_ours).collect()),
         F::Array(None) => Norm::Null,
         F::Push(v) => Norm::Push(v.iter().map(norm_ours).collect()),

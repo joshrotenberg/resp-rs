@@ -92,7 +92,9 @@ fn verbatim_string_txt() {
     let (frame, _) = resp3::parse_frame(Bytes::from("=15\r\ntxt:hello world\r\n")).unwrap();
     assert_eq!(
         frame,
-        Frame::VerbatimString(Bytes::from("txt"), Bytes::from("hello world"))
+        Frame::VerbatimString {
+            payload: Bytes::from("txt:hello world")
+        }
     );
 }
 
@@ -101,7 +103,9 @@ fn verbatim_string_mkd() {
     let (frame, _) = resp3::parse_frame(Bytes::from("=12\r\nmkd:# Header\r\n")).unwrap();
     assert_eq!(
         frame,
-        Frame::VerbatimString(Bytes::from("mkd"), Bytes::from("# Header"))
+        Frame::VerbatimString {
+            payload: Bytes::from("mkd:# Header")
+        }
     );
 }
 

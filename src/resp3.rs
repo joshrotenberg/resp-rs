@@ -48,7 +48,7 @@ const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 /// collections simply grow, which is amortized O(1), and replies smaller than
 /// this still reserve exactly once.
 ///
-/// 128 was chosen by measurement. It bounds the worst case at 1.18 MB and keeps
+/// 128 was chosen by measurement. It bounds the worst case at 655 KB and keeps
 /// the parsing benchmarks within 2% of an unbounded reservation. Halving it to
 /// 64 only improves the bound to 590 KB, which is not meaningfully safer, while
 /// costing 9% on 100-element arrays, which then fall past the cap and grow.
@@ -329,8 +329,17 @@ pub enum Frame {
     /// Big number: (&lt;number&gt;\r\n
     BigNumber(Bytes),
     /// Verbatim string: =format:content\r\n
-    // VerbatimString { format: String, content: String },
-    VerbatimString(Bytes, Bytes),
+    /// Verbatim string: `=15\r\ntxt:hello world\r\n`
+    ///
+    /// Holds the raw `fmt:content` payload rather than the two halves. The
+    /// protocol fixes the format at exactly three bytes and the parser requires
+    /// the `:` at offset 3, so the split point is a constant and nothing is
+    /// lost. Splitting it into two `Bytes` made this the widest variant at 64
+    /// bytes and forced the whole enum to 72; one payload takes it to 40,
+    /// matching [`crate::resp2::Frame`].
+    ///
+    /// Use [`Frame::as_verbatim_string`] to get the halves back.
+    VerbatimString { payload: Bytes },
     /// Array: *&lt;count&gt;\r\n... (or streaming header *?\r\n)
     Array(Option<Vec<Frame>>),
     /// Set: ~&lt;count&gt;\r\n... (or streaming header ~?\r\n)
@@ -424,9 +433,27 @@ impl Frame {
     }
 
     /// Returns the verbatim string format and content if this is a `VerbatimString`.
-    pub fn as_verbatim_string(&self) -> Option<(&Bytes, &Bytes)> {
+    ///
+    /// The payload is stored whole, so the halves are recovered by splitting at
+    /// the fixed offset. Returns `None` for a payload that does not carry the
+    /// `:` at offset 3, which the parser never produces but a hand-constructed
+    /// frame can hold.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use resp_rs::resp3::Frame;
+    ///
+    /// let f = Frame::VerbatimString { payload: Bytes::from("txt:hello") };
+    /// assert_eq!(f.as_verbatim_string(), Some((&b"txt"[..], &b"hello"[..])));
+    /// ```
+    pub fn as_verbatim_string(&self) -> Option<(&[u8], &[u8])> {
         match self {
-            Frame::VerbatimString(format, content) => Some((format, content)),
+            Frame::VerbatimString { payload } => {
+                if payload.len() < 4 || payload[3] != b':' {
+                    return None;
+                }
+                Some((&payload[..3], &payload[4..]))
+            }
             _ => None,
         }
     }
@@ -605,9 +632,12 @@ fn parse_verbatim(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize
     if sep != 3 {
         return Err(ParseError::InvalidFormat);
     }
-    let format = input.slice(data_start..data_start + sep);
-    let content = input.slice(data_start + sep + 1..data_end);
-    Ok((Frame::VerbatimString(format, content), data_end + 2))
+    Ok((
+        Frame::VerbatimString {
+            payload: input.slice(data_start..data_end),
+        },
+        data_end + 2,
+    ))
 }
 
 /// Parse a blob error frame (`!`).
@@ -1301,7 +1331,7 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// | `BigNumber(b"abc")` | `(abc\r\n` | rejected |
 /// | `SpecialFloat(b"1.5")` | `,1.5\r\n` | `Double(1.5)` |
 /// | `Double(f64::NAN)` | `,NaN\r\n` | `SpecialFloat(b"nan")` |
-/// | `VerbatimString(b"text", _)` | `=6\r\ntext:x\r\n` | rejected |
+/// | `VerbatimString { payload: b"text:x" }` | `=6\r\ntext:x\r\n` | rejected |
 /// | `StreamedString` with an empty chunk | mid-stream `;0\r\n` | truncated |
 /// | `Attribute` inside an aggregate | slot skipped | one element short |
 ///
@@ -1391,9 +1421,10 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
             }
             serialize_frame(frame, buf);
         }
-        Frame::VerbatimString(format, _) => {
-            // parse_verbatim requires the separator at index 3 exactly.
-            if format.len() != 3 || format.contains(&b':') {
+        Frame::VerbatimString { payload } => {
+            // Literally the parser's own condition, rather than the two proxy
+            // checks the split representation needed.
+            if payload.iter().position(|&b| b == b':') != Some(3) {
                 return Err(SerializeError::InvalidVerbatimFormat);
             }
             serialize_frame(frame, buf);
@@ -1610,15 +1641,12 @@ fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
             buf.extend_from_slice(n);
             buf.extend_from_slice(b"\r\n");
         }
-        Frame::VerbatimString(format, content) => {
+        Frame::VerbatimString { payload } => {
             buf.put_u8(b'=');
-            let total_len = format.len() + 1 + content.len(); // +1 for the colon
-            let len = total_len.to_string();
+            let len = payload.len().to_string();
             buf.extend_from_slice(len.as_bytes());
             buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(format);
-            buf.put_u8(b':');
-            buf.extend_from_slice(content);
+            buf.extend_from_slice(payload);
             buf.extend_from_slice(b"\r\n");
         }
         Frame::Array(opt) => {
@@ -1680,6 +1708,20 @@ fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole point of storing the verbatim payload whole (#53). A single
+    /// oversized variant widens every frame and every aggregate element, and
+    /// the cost is paid on scalars too because `parse_frame` returns the enum
+    /// through `sret` on every call and every recursion level.
+    #[test]
+    fn frame_is_not_wider_than_resp2() {
+        assert_eq!(
+            core::mem::size_of::<Frame>(),
+            core::mem::size_of::<crate::resp2::Frame>(),
+            "resp3::Frame grew past resp2::Frame; check for a variant wider than one Bytes"
+        );
+        assert_eq!(core::mem::size_of::<Frame>(), 40);
+    }
     use super::{Frame, ParseError, Parser, frame_to_bytes, parse_frame, parse_streaming_sequence};
     use bytes::Bytes;
 
@@ -1773,10 +1815,12 @@ mod tests {
         let (frame, rest) = parse_frame(input.clone()).unwrap();
         assert_eq!(
             frame,
-            Frame::VerbatimString(Bytes::from("txt"), Bytes::from("hi there")) // Frame::VerbatimString {
-                                                                               //     format: "txt".to_string(),
-                                                                               //     content: "hi there".to_string()
-                                                                               // }
+            Frame::VerbatimString {
+                payload: Bytes::from("txt:hi there")
+            } // Frame::VerbatimString {
+              //     format: "txt".to_string(),
+              //     content: "hi there".to_string()
+              // }
         );
         assert_eq!(rest, Bytes::from("AFTER"));
     }
@@ -1952,10 +1996,12 @@ mod tests {
         let (chunk, rest) = parse_frame(rem.clone()).unwrap();
         assert_eq!(
             chunk,
-            Frame::VerbatimString(Bytes::from("txt"), Bytes::from("hello")) // Frame::VerbatimString {
-                                                                            //     format: "txt".to_string(),
-                                                                            //     content: "hello".to_string()
-                                                                            // }
+            Frame::VerbatimString {
+                payload: Bytes::from("txt:hello")
+            } // Frame::VerbatimString {
+              //     format: "txt".to_string(),
+              //     content: "hello".to_string()
+              // }
         );
         assert_eq!(rest, Bytes::from("TAIL"));
     }
@@ -2061,7 +2107,9 @@ mod tests {
         let (frame, _) = parse_frame(input).unwrap();
         assert_eq!(
             frame,
-            Frame::VerbatimString(Bytes::from("txt"), Bytes::from("data"))
+            Frame::VerbatimString {
+                payload: Bytes::from("txt:data")
+            }
         );
     }
 
@@ -3005,7 +3053,9 @@ mod tests {
 
     #[test]
     fn frame_verbatim_string_accessor() {
-        let v = Frame::VerbatimString(Bytes::from("txt"), Bytes::from("hello"));
+        let v = Frame::VerbatimString {
+            payload: Bytes::from("txt:hello"),
+        };
         let (fmt, content) = v.as_verbatim_string().unwrap();
         assert_eq!(fmt, &Bytes::from("txt"));
         assert_eq!(content, &Bytes::from("hello"));

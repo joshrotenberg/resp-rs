@@ -100,7 +100,7 @@
 //!
 //! // Verbatim string
 //! let (frame, _) = resp3::parse_frame(Bytes::from("=15\r\ntxt:hello world\r\n")).unwrap();
-//! assert_eq!(frame, Frame::VerbatimString(Bytes::from("txt"), Bytes::from("hello world")));
+//! assert_eq!(frame, Frame::VerbatimString { payload: Bytes::from("txt:hello world") });
 //!
 //! // Blob error
 //! let (frame, _) = resp3::parse_frame(Bytes::from("!5\r\nOOPS!\r\n")).unwrap();
@@ -501,9 +501,10 @@ pub enum SerializeError {
     #[error("double must be finite; use SpecialFloat for inf and nan")]
     NonFiniteDouble,
 
-    /// A verbatim string format tag is not exactly three bytes, or contains a
-    /// colon. The parser requires the separator at index 3 exactly.
-    #[error("verbatim string format must be exactly 3 bytes with no colon")]
+    /// A verbatim string payload does not carry its separator at index 3. The
+    /// parser requires `fmt:content` with a three-byte format tag, so any other
+    /// shape serializes to wire the parser will not read back.
+    #[error("verbatim string payload must have ':' at index 3, as in \"txt:...\"")]
     InvalidVerbatimFormat,
 
     /// A streamed string contains an empty chunk. An empty chunk is the
