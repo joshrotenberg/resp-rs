@@ -1019,3 +1019,93 @@ fn an_over_long_line_is_rejected_even_when_terminated() {
     wire.extend_from_slice(b"\r\n");
     assert!(resp3::parse_frame(Bytes::from(wire)).is_ok());
 }
+
+// --- Checked serializer round-trip property (issues #82, #83, #84, #85) ---
+//
+// try_frame_to_bytes documents an iff: it succeeds exactly when the bytes parse
+// back to an identical frame with nothing left over. These are the four ways it
+// was violated, kept as literal reproductions from the issues.
+
+#[test]
+fn line_payload_over_the_ceiling_is_refused() {
+    // #82. #63 and #71 tightened the parser; the serializer was not brought
+    // along, so an over-long payload passed the checked path and the parser
+    // then rejected the bytes.
+    let payload = vec![b'a'; resp3::MAX_LINE_LENGTH + 1];
+    let frame = Frame::SimpleString(Bytes::from(payload));
+    assert_eq!(
+        resp3::try_frame_to_bytes(&frame),
+        Err(resp_rs::SerializeError::LineTooLong)
+    );
+    // At the ceiling it is still accepted, and still round-trips.
+    let ok = Frame::SimpleString(Bytes::from(vec![b'b'; resp3::MAX_LINE_LENGTH]));
+    let bytes = resp3::try_frame_to_bytes(&ok).unwrap();
+    assert_eq!(resp3::parse_frame(bytes).unwrap().0, ok);
+}
+
+#[test]
+fn assembled_streaming_frame_cannot_be_nested() {
+    // #83. The wire is `*1\r\n$?\r\n;3\r\nabc\r\n;0\r\n`, which parses without
+    // error as Array([StreamedStringHeader]) with 13 bytes left over, so the
+    // leftover surfaces as the next reply.
+    let frame = Frame::Array(Some(vec![Frame::StreamedString(vec![Bytes::from_static(
+        b"abc",
+    )])]));
+    assert_eq!(
+        resp3::try_frame_to_bytes(&frame),
+        Err(resp_rs::SerializeError::NestedStreamingFrame)
+    );
+    // Top level is the position parse_streaming_sequence can reproduce, so it
+    // stays accepted there.
+    let top = Frame::StreamedString(vec![Bytes::from_static(b"abc")]);
+    let bytes = resp3::try_frame_to_bytes(&top).unwrap();
+    assert_eq!(resp3::parse_streaming_sequence(bytes).unwrap().0, top);
+}
+
+#[test]
+fn terminator_in_a_streamed_aggregate_is_refused() {
+    // #84. A streamed aggregate is terminated rather than counted, so a
+    // terminator inside one ends its own container early.
+    let frame = Frame::StreamedArray(vec![Frame::StreamTerminator]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&frame),
+        Err(resp_rs::SerializeError::TerminatorInStreamedAggregate)
+    );
+
+    // The position is what matters, and the rule is the opposite of the
+    // attribute rule. Inside a COUNTED aggregate the count says how many frames
+    // to read and `.\r\n` parses as one, so it round-trips.
+    let counted = Frame::Array(Some(vec![Frame::StreamTerminator]));
+    let bytes = resp3::try_frame_to_bytes(&counted).unwrap();
+    assert_eq!(resp3::parse_frame(bytes).unwrap().0, counted);
+}
+
+#[test]
+fn streamed_aggregate_contents_are_validated() {
+    // #85. The catch-all arm handed these to the unchecked writer, so no
+    // per-frame check ran inside them. This is #60's CRLF injection resurfacing
+    // through the one path #60 did not cover.
+    let frame = Frame::StreamedArray(vec![Frame::SimpleString(Bytes::from_static(b"sp\r\nlit"))]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&frame),
+        Err(resp_rs::SerializeError::LineContainsCrlf)
+    );
+
+    // The worse shape from the issue: a payload that splits into two frames
+    // which both parse, so the array comes back with a phantom element and no
+    // error at all.
+    let injected =
+        Frame::StreamedArray(vec![Frame::SimpleString(Bytes::from_static(b"sp\r\n+ok"))]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&injected),
+        Err(resp_rs::SerializeError::LineContainsCrlf)
+    );
+
+    // Every other per-frame check applies inside a streamed aggregate too.
+    let bad_double = Frame::StreamedSet(vec![Frame::Double(f64::NAN)]);
+    assert!(resp3::try_frame_to_bytes(&bad_double).is_err());
+    let bad_verbatim = Frame::StreamedPush(vec![Frame::VerbatimString {
+        payload: Bytes::from_static(b"ab:cd"),
+    }]);
+    assert!(resp3::try_frame_to_bytes(&bad_verbatim).is_err());
+}

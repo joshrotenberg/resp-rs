@@ -128,6 +128,70 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
     ]
 }
 
+/// The six frames only `parse_streaming_sequence` produces, and only at the top
+/// level. Mirrors `resp3::is_assembled_streaming`.
+fn is_assembled_streaming(frame: &resp_rs::resp3::Frame) -> bool {
+    use resp_rs::resp3::Frame;
+    matches!(
+        frame,
+        Frame::StreamedString(_)
+            | Frame::StreamedArray(_)
+            | Frame::StreamedSet(_)
+            | Frame::StreamedMap(_)
+            | Frame::StreamedAttribute(_)
+            | Frame::StreamedPush(_)
+    )
+}
+
+/// Frames including shapes that deliberately may NOT round-trip.
+///
+/// `arb_resp3_frame` is the round-trippable set, and several tests depend on
+/// that, so the questionable shapes live here instead. Only the iff property
+/// consumes this, because it is the one assertion that accepts either outcome
+/// and decides which is correct by construction.
+///
+/// These are the positions the old generator could not reach, which is why the
+/// iff property held while issues #82 through #85 were live. The property was
+/// right; the generator could not produce a counterexample.
+fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
+    use resp_rs::resp3::Frame;
+
+    let element = prop_oneof![
+        8 => arb_resp3_frame(),
+        // Terminates a streamed container in place, but is an ordinary element
+        // inside a counted one (#84). The opposite rule to Attribute, which is
+        // why one shared check produced an immediate counterexample.
+        1 => Just(Frame::StreamTerminator),
+        // Only parse_streaming_sequence produces these, and only at the top
+        // level, so nesting one emits bytes that read back as a bare header
+        // with the body left over (#83).
+        1 => Just(Frame::StreamedString(vec![Bytes::from_static(b"abc")])),
+        1 => Just(Frame::StreamedArray(vec![Frame::Integer(1)])),
+        // A payload the parser refuses at this length (#82). Kept just over the
+        // bound so the generator stays cheap.
+        1 => Just(Frame::SimpleString(Bytes::from(vec![b'a'; resp_rs::resp3::MAX_LINE_LENGTH + 1]))),
+        // CRLF inside a line payload, which the checked path catches at top
+        // level but skipped inside streamed aggregates (#85).
+        1 => Just(Frame::SimpleString(Bytes::from_static(b"sp\r\nlit"))),
+    ];
+
+    prop_oneof![
+        8 => arb_resp3_frame(),
+        // Counted aggregates carrying the questionable elements.
+        2 => prop::collection::vec(element.clone(), 0..4).prop_map(|v| Frame::Array(Some(v))),
+        2 => prop::collection::vec(element.clone(), 0..4).prop_map(Frame::Push),
+        // Streamed aggregates, whose contents bypassed every per-frame check
+        // through the catch-all arm (#85).
+        2 => prop::collection::vec(element.clone(), 0..4).prop_map(Frame::StreamedArray),
+        2 => prop::collection::vec(element.clone(), 0..4).prop_map(Frame::StreamedSet),
+        2 => prop::collection::vec(element.clone(), 0..4).prop_map(Frame::StreamedPush),
+        2 => prop::collection::vec((element.clone(), element.clone()), 0..3)
+                .prop_map(Frame::StreamedMap),
+        2 => prop::collection::vec((element.clone(), element), 0..3)
+                .prop_map(Frame::StreamedAttribute),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -688,12 +752,24 @@ proptest! {
     /// arm tightening without a matching serializer rule breaks this
     /// immediately, which is how #67 opened the BigNumber gap unnoticed.
     #[test]
-    fn resp3_checked_serialization_iff_roundtrip(frame in arb_resp3_frame()) {
-        let round_trips = match resp_rs::resp3::parse_frame(
-            resp_rs::resp3::frame_to_bytes(&frame),
-        ) {
-            Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
-            Err(_) => false,
+    fn resp3_checked_serialization_iff_roundtrip(frame in arb_resp3_frame_any()) {
+        // Assembled streaming frames are read back by parse_streaming_sequence,
+        // never by parse_frame, which sees only their bare header and leaves the
+        // body behind. Using parse_frame for them would assert that they can
+        // never be serialized, which is not what the crate claims: the top level
+        // is exactly where they are legitimate. The entry point is chosen by
+        // shape so the property tests the reader the frame actually has.
+        let bytes = resp_rs::resp3::frame_to_bytes(&frame);
+        let round_trips = if is_assembled_streaming(&frame) {
+            match resp_rs::resp3::parse_streaming_sequence(bytes) {
+                Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
+                Err(_) => false,
+            }
+        } else {
+            match resp_rs::resp3::parse_frame(bytes) {
+                Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
+                Err(_) => false,
+            }
         };
         prop_assert_eq!(
             resp_rs::resp3::try_frame_to_bytes(&frame).is_ok(),
