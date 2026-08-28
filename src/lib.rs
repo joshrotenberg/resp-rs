@@ -517,4 +517,38 @@ pub enum SerializeError {
     /// the parser skips them and the aggregate comes back one element short.
     #[error("attribute cannot occupy an aggregate element slot")]
     AttributeInAggregate,
+
+    /// A line payload exceeds the parser's line ceiling, so the frame would
+    /// serialize to bytes the parser rejects with `ParseError::LineTooLong`.
+    ///
+    /// See [`resp2::MAX_LINE_LENGTH`] and [`resp3::MAX_LINE_LENGTH`].
+    #[error("line payload exceeds the maximum line length")]
+    LineTooLong,
+
+    /// A length-prefixed payload exceeds the parser's bulk ceiling, so the
+    /// frame would serialize to a header the parser rejects with
+    /// `ParseError::BadLength`.
+    #[error("payload exceeds the maximum bulk string size")]
+    PayloadTooLong,
+
+    /// An assembled streaming frame appears somewhere other than the top level.
+    ///
+    /// `StreamedString`, `StreamedArray`, `StreamedSet`, `StreamedMap`,
+    /// `StreamedAttribute` and `StreamedPush` are produced only by
+    /// [`resp3::parse_streaming_sequence`], and only at the top level.
+    /// `parse_frame` reads their wire form back as the bare header and leaves
+    /// the body in the buffer, so nesting one desynchronizes the stream rather
+    /// than merely producing a different tree.
+    #[error("assembled streaming frame cannot be nested")]
+    NestedStreamingFrame,
+
+    /// A `StreamTerminator` appears as an element of a streamed aggregate,
+    /// where it is that container's own terminator and would end it early.
+    ///
+    /// The position matters. Inside a counted aggregate a terminator is an
+    /// ordinary element and round-trips, which is why this is a separate rule
+    /// from [`SerializeError::AttributeInAggregate`] rather than a shared one:
+    /// the two nested positions need opposite checks.
+    #[error("stream terminator cannot be an element of a streamed aggregate")]
+    TerminatorInStreamedAggregate,
 }

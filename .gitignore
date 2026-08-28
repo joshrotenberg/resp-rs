@@ -9,3 +9,7 @@ benches/redis_c_comparison.rs
 # experiments/proto-resp/build.rs, which made release-plz abort on every push
 # to main with "the working directory of this project has uncommitted changes".
 /build.rs
+
+# Proptest writes failing seeds here. Regenerated on demand; the boundary
+# cases that matter are pinned by deterministic tests instead.
+tests/*.proptest-regressions

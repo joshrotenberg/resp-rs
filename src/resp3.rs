@@ -1369,7 +1369,58 @@ fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
     if payload.windows(2).any(|w| w == b"\r\n") {
         return Err(SerializeError::LineContainsCrlf);
     }
+    // Same constant the parser scans against, so the two cannot drift. #63 and
+    // #71 tightened the parser here and the serializer was not brought along,
+    // which is issue #82.
+    if payload.len() > MAX_LINE_LENGTH {
+        return Err(SerializeError::LineTooLong);
+    }
     Ok(())
+}
+
+/// Length-prefixed bodies are bounded by the parser too, and a header over the
+/// ceiling comes back as `ParseError::BadLength` (#82).
+#[inline]
+fn check_bulk_payload(payload: &[u8]) -> Result<(), SerializeError> {
+    if payload.len() > MAX_BULK_STRING_SIZE {
+        return Err(SerializeError::PayloadTooLong);
+    }
+    Ok(())
+}
+
+/// True for the six frames only [`parse_streaming_sequence`] produces, and only
+/// at the top level. `parse_frame` reads their wire form back as the bare
+/// header and leaves the body in the buffer, so nesting one desynchronizes the
+/// stream (#83).
+#[inline]
+fn is_assembled_streaming(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::StreamedString(_)
+            | Frame::StreamedArray(_)
+            | Frame::StreamedSet(_)
+            | Frame::StreamedMap(_)
+            | Frame::StreamedAttribute(_)
+            | Frame::StreamedPush(_)
+    )
+}
+
+/// Serialize one element of a STREAMED aggregate.
+///
+/// The rules here are the opposite of [`try_serialize_element`]'s, which is why
+/// they are separate functions rather than one shared check. A streamed
+/// aggregate is terminated rather than counted, so a `StreamTerminator` inside
+/// it ends the container early (#84), while an `Attribute` is fine because
+/// there is no slot to consume. In a counted aggregate it is exactly reversed.
+#[inline]
+fn try_serialize_streamed_element(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
+    if matches!(frame, Frame::StreamTerminator) {
+        return Err(SerializeError::TerminatorInStreamedAggregate);
+    }
+    if is_assembled_streaming(frame) {
+        return Err(SerializeError::NestedStreamingFrame);
+    }
+    try_serialize_frame(frame, buf)
 }
 
 /// Serialize one aggregate element. An attribute cannot occupy a slot, because
@@ -1378,6 +1429,9 @@ fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
 fn try_serialize_element(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
     if matches!(frame, Frame::Attribute(_)) {
         return Err(SerializeError::AttributeInAggregate);
+    }
+    if is_assembled_streaming(frame) {
+        return Err(SerializeError::NestedStreamingFrame);
     }
     try_serialize_frame(frame, buf)
 }
@@ -1474,8 +1528,55 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
                 try_serialize_element(v, buf)?;
             }
         }
-        // Everything else is either length-prefixed, written from a typed
-        // value, or a fixed token, so it cannot misrepresent itself.
+        // Streamed aggregates hold arbitrary frames, so they cannot fall to the
+        // catch-all: doing so handed their contents to the unchecked writer and
+        // skipped every per-frame check inside them (#85). Their elements go
+        // through try_serialize_streamed_element, whose rules are the opposite
+        // of a counted aggregate's.
+        Frame::StreamedArray(items) => {
+            buf.extend_from_slice(b"*?\r\n");
+            for item in items {
+                try_serialize_streamed_element(item, buf)?;
+            }
+            buf.extend_from_slice(b".\r\n");
+        }
+        Frame::StreamedSet(items) => {
+            buf.extend_from_slice(b"~?\r\n");
+            for item in items {
+                try_serialize_streamed_element(item, buf)?;
+            }
+            buf.extend_from_slice(b".\r\n");
+        }
+        Frame::StreamedPush(items) => {
+            buf.extend_from_slice(b">?\r\n");
+            for item in items {
+                try_serialize_streamed_element(item, buf)?;
+            }
+            buf.extend_from_slice(b".\r\n");
+        }
+        Frame::StreamedMap(pairs) => {
+            buf.extend_from_slice(b"%?\r\n");
+            for (k, v) in pairs {
+                try_serialize_streamed_element(k, buf)?;
+                try_serialize_streamed_element(v, buf)?;
+            }
+            buf.extend_from_slice(b".\r\n");
+        }
+        Frame::StreamedAttribute(pairs) => {
+            buf.extend_from_slice(b"|?\r\n");
+            for (k, v) in pairs {
+                try_serialize_streamed_element(k, buf)?;
+                try_serialize_streamed_element(v, buf)?;
+            }
+            buf.extend_from_slice(b".\r\n");
+        }
+        // Length-prefixed bodies are bounded by the parser as well (#82).
+        Frame::BulkString(Some(b)) | Frame::BlobError(b) | Frame::StreamedStringChunk(b) => {
+            check_bulk_payload(b)?;
+            serialize_frame(frame, buf);
+        }
+        // What remains is written from a typed value or is a fixed token, so it
+        // cannot misrepresent itself.
         other => serialize_frame(other, buf),
     }
     Ok(())
