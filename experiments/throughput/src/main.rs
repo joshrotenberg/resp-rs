@@ -192,14 +192,9 @@ async fn run_server(addr: &str, format: Format) -> std::io::Result<()> {
 
         tokio::spawn(async move {
             let mut buf = BytesMut::with_capacity(4096);
-            loop {
-                match read_one_frame(&mut stream, &mut buf, format).await {
-                    Ok(true) => {
-                        if stream.write_all(&response).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(true) = read_one_frame(&mut stream, &mut buf, format).await {
+                if stream.write_all(&response).await.is_err() {
+                    break;
                 }
             }
         });
@@ -271,14 +266,10 @@ async fn main() -> std::io::Result<()> {
                         let response = response.clone();
                         tokio::spawn(async move {
                             let mut buf = BytesMut::with_capacity(4096);
-                            loop {
-                                match read_one_frame(&mut stream, &mut buf, format).await {
-                                    Ok(true) => {
-                                        if stream.write_all(&response).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    _ => break,
+                            while let Ok(true) = read_one_frame(&mut stream, &mut buf, format).await
+                            {
+                                if stream.write_all(&response).await.is_err() {
+                                    break;
                                 }
                             }
                         });
