@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-28
+
+### Documentation
+
+- Point install snippets at 0.3 and document the upgrade ([#92](https://github.com/joshrotenberg/resp-rs/pull/92))
+
+### Fixed
+
+- *(unsafe-internals)* Unchecked integer parser rejected the plus sign the safe parser accepts, decoding `:+0\r\n` as `2510` ([#77](https://github.com/joshrotenberg/resp-rs/issues/77), [#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- *(unsafe-internals)* Unchecked double parser returned `Double(inf)` where the safe parser canonicalizes to `SpecialFloat` ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- *(unsafe-internals)* Parse i64::MIN without overflowing the accumulator ([#80](https://github.com/joshrotenberg/resp-rs/pull/80))
+- Restore the checked serializer's round-trip property (closes #82, #83, #84, #85) ([#89](https://github.com/joshrotenberg/resp-rs/pull/89))
+
+### Performance
+
+- Collapse VerbatimString to a single payload (closes #53) ([#87](https://github.com/joshrotenberg/resp-rs/pull/87)) [**breaking**]
+
+### Testing
+
+- Add differential and unchecked fuzz targets ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- Add a RESP3 differential fuzz target (refs #76) ([#86](https://github.com/joshrotenberg/resp-rs/pull/86))
+
+
+
 ## [0.2.0] - 2026-08-14
 
 ### Fixed
