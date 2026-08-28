@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-resp-rs = "0.1"
+resp-rs = "0.3"
 ```
 
 ### Parse a RESP3 frame
@@ -147,13 +147,13 @@ are also fully supported.
 
 ```toml
 # Async Redis client
-resp-rs = { version = "0.1", features = ["codec"] }
+resp-rs = { version = "0.3", features = ["codec"] }
 
 # Embedded / WASM
-resp-rs = { version = "0.1", default-features = false }
+resp-rs = { version = "0.3", default-features = false }
 
 # Everything
-resp-rs = { version = "0.1", features = ["codec", "cluster", "unsafe-internals"] }
+resp-rs = { version = "0.3", features = ["codec", "cluster", "unsafe-internals"] }
 ```
 
 ## Examples
@@ -217,6 +217,62 @@ Run the full benchmark suite:
 ```sh
 cargo bench
 ```
+
+## Upgrading
+
+### 0.2 to 0.3
+
+**`resp3::Frame::VerbatimString` is now a struct variant holding one payload.**
+
+```rust
+// before
+Frame::VerbatimString(format, content)
+
+// after
+Frame::VerbatimString { payload }          // the raw `fmt:content` bytes
+frame.as_verbatim_string()                 // Option<(&[u8], &[u8])>, split at the fixed offset
+```
+
+The protocol fixes the format tag at three bytes and the parser requires the
+separator at offset 3, so storing the payload whole loses nothing and takes
+`size_of::<resp3::Frame>()` from 72 to 40. That is a per-element saving in every
+aggregate, and it makes RESP3 parsing 22 to 38 percent faster on scalars.
+
+It is a struct variant on purpose. A tuple form would let
+`VerbatimString(_, content)` be "fixed" by deleting the `_,`, which compiles and
+silently rebinds `content` to the whole payload including the `txt:` prefix. The
+struct form fails to compile instead, so every site gets looked at.
+
+**`SerializeError` has four new variants**: `LineTooLong`, `PayloadTooLong`,
+`NestedStreamingFrame`, `TerminatorInStreamedAggregate`. It is
+`#[non_exhaustive]`, so a wildcard arm already covers them.
+
+`try_frame_to_bytes` now rejects frames it previously accepted, in each case
+because the bytes it would have emitted do not parse back:
+
+| rejected shape | why |
+| --- | --- |
+| line payload over `MAX_LINE_LENGTH` | parser answers `LineTooLong` |
+| body over `MAX_BULK_STRING_SIZE` | parser answers `BadLength` |
+| assembled streaming frame nested in an aggregate | reads back as the bare header, body left in the buffer |
+| `StreamTerminator` inside a streamed aggregate | ends its own container early |
+| any invalid frame inside a streamed aggregate | previously skipped validation entirely |
+
+If you were relying on any of those succeeding, the frames were producing wire
+the parser could not read back, and the last one is a CRLF-injection vector.
+
+### 0.1 to 0.2
+
+`ParseError` gained `#[non_exhaustive]` plus `DepthExceeded` and `LineTooLong`;
+`CodecError` gained `#[non_exhaustive]` plus `Serialize`. Exhaustive matches need
+a wildcard arm.
+
+The RESP3 streamed-string terminator changed on the wire from `;0\r\n\r\n` to
+`;0\r\n`, which is what the spec specifies. A captured corpus or a hand-rolled
+peer expecting six bytes needs updating.
+
+Attributes no longer consume an aggregate element slot, which previously
+truncated the aggregate and desynchronized the connection.
 
 ## Minimum Supported Rust Version
 

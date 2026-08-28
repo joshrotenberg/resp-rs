@@ -204,7 +204,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! resp-rs = { version = "0.1", features = ["codec"] }
+//! resp-rs = { version = "0.3", features = ["codec"] }
 //! tokio = { version = "1", features = ["net"] }
 //! tokio-util = { version = "0.7", features = ["codec"] }
 //! futures = "0.3"  # for SinkExt / StreamExt
@@ -282,7 +282,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! resp-rs = { version = "0.1", features = ["cluster"] }
+//! resp-rs = { version = "0.3", features = ["cluster"] }
 //! ```
 //!
 //! ```ignore
@@ -302,7 +302,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! resp-rs = { version = "0.1", default-features = false }
+//! resp-rs = { version = "0.3", default-features = false }
 //! ```
 //!
 //! All core parsing and serialization works without `std`. The `codec` feature
