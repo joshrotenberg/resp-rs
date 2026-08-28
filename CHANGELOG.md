@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(unsafe-internals)* Unchecked integer parser rejected the plus sign the safe parser accepts, decoding `:+0\r\n` as `2510` ([#77](https://github.com/joshrotenberg/resp-rs/issues/77), [#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- *(unsafe-internals)* Unchecked double parser returned `Double(inf)` where the safe parser canonicalizes to `SpecialFloat` ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
 - *(unsafe-internals)* Parse i64::MIN without overflowing the accumulator ([#80](https://github.com/joshrotenberg/resp-rs/pull/80))
 - Restore the checked serializer's round-trip property (closes #82, #83, #84, #85) ([#89](https://github.com/joshrotenberg/resp-rs/pull/89))
 
@@ -22,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
-- Add differential and unchecked fuzz targets, and fix the two bugs they found ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
+- Add differential and unchecked fuzz targets ([#78](https://github.com/joshrotenberg/resp-rs/pull/78))
 - Add a RESP3 differential fuzz target (refs #76) ([#86](https://github.com/joshrotenberg/resp-rs/pull/86))
 
 
