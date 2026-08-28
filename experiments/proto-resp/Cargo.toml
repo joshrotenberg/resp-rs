@@ -12,3 +12,6 @@ resp-rs = { path = "../.." }
 
 [build-dependencies]
 prost-build = "0.13"
+# Ships a protoc binary so the workspace builds without a system
+# protobuf-compiler, which CI runners do not have.
+protoc-bin-vendored = "3"
