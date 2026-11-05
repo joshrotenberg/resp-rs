@@ -642,3 +642,11 @@ fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
         assert!(rest.is_empty());
     }
 }
+
+#[test]
+fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::from_static(b"*01\r\n:1\r\n+next\r\n"));
+    assert_eq!(parser.next_frame(), Err(ParseError::BadLength));
+    assert_eq!(parser.next_frame(), Ok(None));
+}

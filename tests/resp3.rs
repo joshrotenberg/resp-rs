@@ -669,6 +669,10 @@ fn lengths_and_counts_reject_non_canonical_forms() {
         &b"=08\r\ntxt:data\r\n"[..],
         &b";01\r\nx\r\n"[..],
         &b";00\r\n"[..],
+        &b";-1\r\n"[..],
+        &b"|01\r\n+a\r\n:1\r\n"[..],
+        &b"=-0\r\n"[..],
+        &b"!-0\r\n"[..],
     ] {
         assert_eq!(
             resp3::parse_frame(Bytes::copy_from_slice(wire)),
@@ -692,6 +696,10 @@ fn canonical_lengths_and_counts_parse() {
         &b"%0\r\n"[..],
         &b"!0\r\n\r\n"[..],
         &b";10\r\n0123456789\r\n"[..],
+        // Streamed headers carry `?` rather than a number.
+        &b"$?\r\n"[..],
+        &b"*?\r\n"[..],
+        &b"%?\r\n"[..],
     ] {
         let (_, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
             .unwrap_or_else(|e| panic!("{:?}: {e:?}", String::from_utf8_lossy(wire)));
@@ -1531,4 +1539,20 @@ fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
         assert_eq!(parsed, frame);
         assert!(rest.is_empty());
     }
+}
+
+#[test]
+fn non_canonical_chunk_length_in_a_streamed_string_is_rejected() {
+    assert_eq!(
+        resp3::parse_streaming_sequence(Bytes::from_static(b"$?\r\n;01\r\nx\r\n;0\r\n")),
+        Err(ParseError::BadLength)
+    );
+}
+
+#[test]
+fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::from_static(b":+1\r\n+next\r\n"));
+    assert_eq!(parser.next_frame(), Err(ParseError::InvalidFormat));
+    assert_eq!(parser.next_frame(), Ok(None));
 }

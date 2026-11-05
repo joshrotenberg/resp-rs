@@ -194,6 +194,15 @@ mod tests {
     use crate::resp2;
 
     #[test]
+    fn plus_sign_is_skipped_not_wrapped() {
+        // Outside the contract since #102, but the `+` skip from #77 stays so
+        // that a contract violation gives a value rather than a wrapped byte
+        // (2510 for `:+0`, or a panic under debug assertions).
+        let (frame, _) = unsafe { parse_frame_unchecked(Bytes::from_static(b":+0\r\n")) };
+        assert_eq!(frame, Frame::Integer(0));
+    }
+
+    #[test]
     fn unchecked_matches_safe() {
         let cases = vec![
             "+OK\r\n",
