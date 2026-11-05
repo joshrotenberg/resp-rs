@@ -21,6 +21,9 @@
 //!   them to canonical [`Frame::SpecialFloat`] values (`inf`, `-inf`, `nan`).
 //!   This means roundtrip is semantic (value-preserving) but not lexical
 //!   (byte-preserving) for non-canonical inputs.
+//! - **Push frames** are accepted in any position, although the spec says they
+//!   only appear at the top level. A nested push is returned as an element of
+//!   its reply: see [`Frame::Push`].
 //! - **Streaming support** for blob errors and verbatim strings is limited:
 //!   `parse_streaming_sequence` passes through their streaming headers
 //!   (`!?\r\n`, `=?\r\n`) without accumulation, since RESP3 does not define
@@ -63,8 +66,16 @@ const PREALLOC_CAP: usize = 128;
 /// stack and abort the process. Input nested more deeply than this is rejected
 /// with [`ParseError::DepthExceeded`].
 ///
-/// Redis does not nest replies anywhere near this deep, so the limit is not
-/// reachable by real traffic.
+/// Ordinary replies stay far below this, but Redis can exceed it: a Lua script
+/// that returns a self-referencing table makes the server emit nested arrays
+/// far deeper than this, until Lua's stack limit stops it (#106). That reply is rejected here. Like every
+/// error other than [`ParseError::Incomplete`], [`ParseError::DepthExceeded`]
+/// leaves the position of the next frame unknown, so close the connection
+/// rather than continuing to read from it.
+///
+/// In [`parse_streaming_sequence`], counted and streamed aggregates spend from
+/// the same budget. [`parse_frame`], [`Parser`] and the `Codec` return a
+/// streamed header without reading its body, so it costs nothing there.
 pub const MAX_DEPTH: u32 = 128;
 
 /// Maximum length of a single CRLF-terminated line.
@@ -140,7 +151,9 @@ impl Parser {
     ///
     /// Returns `Ok(None)` if there is not enough data to parse a complete frame.
     /// Returns `Ok(Some(frame))` on success, consuming the parsed bytes.
-    /// Returns `Err` on protocol errors, clearing the buffer.
+    /// Returns `Err` on protocol errors, clearing the buffer. After an error
+    /// other than `Incomplete` the stream position is unknown, so close the
+    /// connection: see [`ParseError`].
     pub fn next_frame(&mut self) -> Result<Option<Frame>, ParseError> {
         self.merge_pending();
         if self.buffer.is_empty() {
@@ -351,6 +364,23 @@ pub enum Frame {
     /// Attribute: |&lt;count&gt;\r\n... (or streaming header |?\r\n)
     Attribute(Vec<(Frame, Frame)>),
     /// Push: > &lt;count&gt;\r\n... (or streaming header >?\r\n)
+    ///
+    /// The RESP3 spec says push data only appears at the top level, between
+    /// replies. The parser accepts a push in any position and returns it where
+    /// it was found, so a push nested in an array or map is part of that reply,
+    /// not an out-of-band message. Route pushes by checking the top-level frame
+    /// only. The same holds for [`Frame::StreamedPush`] and its header. Redis
+    /// once emitted a push inside an `EXEC` reply (redis/redis#12326);
+    /// rejecting that would end the connection instead.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use resp_rs::resp3::{Frame, parse_frame};
+    ///
+    /// // A push nested in an array is an element of the array.
+    /// let (frame, _) = parse_frame(Bytes::from("*1\r\n>1\r\n:1\r\n")).unwrap();
+    /// assert_eq!(frame, Frame::Array(Some(vec![Frame::Push(vec![Frame::Integer(1)])])));
+    /// ```
     Push(Vec<Frame>),
 }
 
