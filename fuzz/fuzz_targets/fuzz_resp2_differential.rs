@@ -113,6 +113,53 @@ fn ours_holds_non_utf8_error(f: &resp2::Frame) -> bool {
     }
 }
 
+/// True if the frame the reference accepted spells a `:` integer, `$` length or
+/// `*` count non-canonically: a `+` sign, a leading zero, or `-0`.
+///
+/// Redis and hiredis reject these (`string2ll`), and so does this crate since
+/// #101 and #102. redis-protocol accepts them on integers. The frame is walked
+/// header by header over the bytes the reference consumed, so a `+` or `0`
+/// inside a simple string or bulk payload excuses nothing.
+fn has_noncanonical_number(data: &[u8], consumed: usize) -> bool {
+    fn line(data: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+        let rel = data.get(pos..)?.windows(2).position(|w| w == b"\r\n")?;
+        Some((&data[pos..pos + rel], pos + rel + 2))
+    }
+    fn noncanonical(text: &[u8]) -> bool {
+        let digits = text.strip_prefix(b"-").unwrap_or(text);
+        text.first() == Some(&b'+')
+            || (digits.first() == Some(&b'0') && (digits.len() > 1 || digits.len() != text.len()))
+    }
+    // Returns whether a non-canonical number was found, and where the frame ends.
+    fn walk(data: &[u8], pos: usize) -> Option<(bool, usize)> {
+        let tag = *data.get(pos)?;
+        let (text, next) = line(data, pos + 1)?;
+        match tag {
+            b'+' | b'-' => Some((false, next)),
+            b':' => Some((noncanonical(text), next)),
+            b'$' | b'*' if noncanonical(text) => Some((true, next)),
+            b'$' => {
+                let n: i64 = core::str::from_utf8(text).ok()?.parse().ok()?;
+                Some((false, if n < 0 { next } else { next + n as usize + 2 }))
+            }
+            b'*' => {
+                let n: i64 = core::str::from_utf8(text).ok()?.parse().ok()?;
+                let mut cursor = next;
+                for _ in 0..n.max(0) {
+                    let (found, end) = walk(data, cursor)?;
+                    if found {
+                        return Some((true, end));
+                    }
+                    cursor = end;
+                }
+                Some((false, cursor))
+            }
+            _ => None,
+        }
+    }
+    matches!(walk(&data[..consumed.min(data.len())], 0), Some((true, _)))
+}
+
 fuzz_target!(|data: &[u8]| {
     let ours = resp2::parse_frame(Bytes::copy_from_slice(data));
     let theirs = redis_protocol::resp2::decode::decode(data);
@@ -172,10 +219,14 @@ fuzz_target!(|data: &[u8]| {
 
         // We reject, they accept. This is the over-strictness direction, and it
         // is exactly how issue #49 would have been caught: the reference reads
-        // `:+42\r\n` as 42 while this crate used to refuse the sign.
+        // `:+42\r\n` as 42 while this crate used to refuse the sign. Since
+        // #102 refusing it is deliberate again, matching Redis and hiredis, so
+        // non-canonical number text is excused by walking the frame for it.
         (Err(e), Ok(Some((their_frame, their_consumed)))) => {
             assert!(
-                is_resource_limit(e) || bulk_laxness_may_apply(data, *their_consumed),
+                is_resource_limit(e)
+                    || bulk_laxness_may_apply(data, *their_consumed)
+                    || has_noncanonical_number(data, *their_consumed),
                 "we reject what the reference accepts\n  input:  {data:?}\n  ours:   {e:?}\n  theirs: {their_frame:?}"
             );
         }
