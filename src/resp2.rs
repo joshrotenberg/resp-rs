@@ -62,8 +62,8 @@ const PREALLOC_CAP: usize = 128;
 /// [`ParseError::DepthExceeded`].
 ///
 /// Ordinary replies stay far below this, but Redis can exceed it: a Lua script
-/// that returns a self-referencing table makes the server emit an array nested
-/// thousands of levels deep (#106). That reply is rejected here. Like every
+/// that returns a self-referencing table makes the server emit nested arrays
+/// far deeper than this, until Lua's stack limit stops it (#106). That reply is rejected here. Like every
 /// error other than [`ParseError::Incomplete`], [`ParseError::DepthExceeded`]
 /// leaves the position of the next frame unknown, so close the connection
 /// rather than continuing to read from it.

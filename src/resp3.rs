@@ -67,13 +67,15 @@ const PREALLOC_CAP: usize = 128;
 /// with [`ParseError::DepthExceeded`].
 ///
 /// Ordinary replies stay far below this, but Redis can exceed it: a Lua script
-/// that returns a self-referencing table makes the server emit an array nested
-/// thousands of levels deep (#106). That reply is rejected here. Like every
+/// that returns a self-referencing table makes the server emit nested arrays
+/// far deeper than this, until Lua's stack limit stops it (#106). That reply is rejected here. Like every
 /// error other than [`ParseError::Incomplete`], [`ParseError::DepthExceeded`]
 /// leaves the position of the next frame unknown, so close the connection
 /// rather than continuing to read from it.
 ///
-/// Counted and streamed aggregates spend from the same budget.
+/// In [`parse_streaming_sequence`], counted and streamed aggregates spend from
+/// the same budget. [`parse_frame`], [`Parser`] and the `Codec` return a
+/// streamed header without reading its body, so it costs nothing there.
 pub const MAX_DEPTH: u32 = 128;
 
 /// Maximum length of a single CRLF-terminated line.
@@ -367,8 +369,18 @@ pub enum Frame {
     /// replies. The parser accepts a push in any position and returns it where
     /// it was found, so a push nested in an array or map is part of that reply,
     /// not an out-of-band message. Route pushes by checking the top-level frame
-    /// only. Redis once emitted a push inside an `EXEC` reply
-    /// (redis/redis#12326); rejecting that would end the connection instead.
+    /// only. The same holds for [`Frame::StreamedPush`] and its header. Redis
+    /// once emitted a push inside an `EXEC` reply (redis/redis#12326);
+    /// rejecting that would end the connection instead.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use resp_rs::resp3::{Frame, parse_frame};
+    ///
+    /// // A push nested in an array is an element of the array.
+    /// let (frame, _) = parse_frame(Bytes::from("*1\r\n>1\r\n:1\r\n")).unwrap();
+    /// assert_eq!(frame, Frame::Array(Some(vec![Frame::Push(vec![Frame::Integer(1)])])));
+    /// ```
     Push(Vec<Frame>),
 }
 
