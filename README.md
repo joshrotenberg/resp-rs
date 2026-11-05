@@ -254,7 +254,7 @@ because the bytes it would have emitted do not parse back:
 | --- | --- |
 | line payload over `MAX_LINE_LENGTH` | parser answers `LineTooLong` |
 | body over `MAX_BULK_STRING_SIZE` | parser answers `BadLength` |
-| assembled streaming frame nested in an aggregate | reads back as the bare header, body left in the buffer |
+| assembled streaming frame nested in a counted aggregate | reads back as the bare header, body left in the buffer |
 | `StreamTerminator` inside a streamed aggregate | ends its own container early |
 | any invalid frame inside a streamed aggregate | previously skipped validation entirely |
 

@@ -515,6 +515,9 @@ pub enum SerializeError {
     /// An attribute appears where an aggregate element is expected. Attributes
     /// carry metadata for the frame that follows and do not occupy a slot, so
     /// the parser skips them and the aggregate comes back one element short.
+    ///
+    /// This covers counted and streamed aggregates, and in a streamed aggregate
+    /// a `StreamedAttribute` element as well.
     #[error("attribute cannot occupy an aggregate element slot")]
     AttributeInAggregate,
 
@@ -531,14 +534,15 @@ pub enum SerializeError {
     #[error("payload exceeds the maximum bulk string size")]
     PayloadTooLong,
 
-    /// An assembled streaming frame appears somewhere other than the top level.
+    /// An assembled streaming frame appears inside a counted aggregate.
     ///
     /// `StreamedString`, `StreamedArray`, `StreamedSet`, `StreamedMap`,
     /// `StreamedAttribute` and `StreamedPush` are produced only by
-    /// [`resp3::parse_streaming_sequence`], and only at the top level.
-    /// `parse_frame` reads their wire form back as the bare header and leaves
-    /// the body in the buffer, so nesting one desynchronizes the stream rather
-    /// than merely producing a different tree.
+    /// [`resp3::parse_streaming_sequence`], at the top level or as an element of
+    /// another streamed aggregate. Inside a counted aggregate `parse_frame`
+    /// reads their wire form back as the bare header and leaves the body in the
+    /// buffer, so nesting one there desynchronizes the stream rather than
+    /// merely producing a different tree.
     #[error("assembled streaming frame cannot be nested")]
     NestedStreamingFrame,
 
@@ -551,4 +555,13 @@ pub enum SerializeError {
     /// the two nested positions need opposite checks.
     #[error("stream terminator cannot be an element of a streamed aggregate")]
     TerminatorInStreamedAggregate,
+
+    /// A bare streamed header (`$?`, `*?`, `~?`, `%?`, `|?` or `>?`) appears as
+    /// an element of a streamed aggregate.
+    ///
+    /// [`resp3::parse_streaming_sequence`] reads the body that follows such a
+    /// header, so the elements after it would be read as its contents. Use the
+    /// assembled frame, such as `StreamedArray`, in this position instead.
+    #[error("bare streamed header cannot be an element of a streamed aggregate")]
+    StreamHeaderInStreamedAggregate,
 }

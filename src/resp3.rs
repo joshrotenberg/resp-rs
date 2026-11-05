@@ -1030,157 +1030,144 @@ pub use codec_impl::Codec;
 /// - For non-streaming frames, this function simply returns the parsed frame
 /// - Streaming string chunks are accumulated in order
 /// - All other streaming types accumulate complete frames until termination
+/// - A streamed value that is a direct element of a streamed aggregate is
+///   assembled too, so `*?\r\n*?\r\n:1\r\n.\r\n.\r\n` is a `StreamedArray`
+///   holding a `StreamedArray`. A streamed header inside a counted aggregate is
+///   still returned as the bare header, as [`parse_frame`] returns it.
+/// - Attributes inside a streamed aggregate are skipped, as they are inside a
+///   counted one: they describe the element that follows and are not elements
+///   themselves. An attribute directly before the `.` terminator is discarded.
+/// - Streamed and counted aggregates share one [`MAX_DEPTH`] budget. A
+///   streamed aggregate spends its unit even when it turns out to be empty,
+///   since that is only known at its terminator; an empty counted aggregate
+///   spends none.
 /// - Zero-copy parsing is used where possible to minimize allocations
 pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
     if input.is_empty() {
         return Err(ParseError::Incomplete);
     }
 
-    let (header, mut rest) = parse_frame(input)?;
+    let (header, pos) = parse_frame_inner(&input, 0, MAX_DEPTH)?;
+    let (frame, end) = assemble_streamed(&input, header, pos, MAX_DEPTH)?;
+    Ok((frame, input.slice(end..)))
+}
 
+/// Read the body of a streamed header that was just parsed and ends at `pos`.
+///
+/// Any other frame is returned unchanged, including the blob error and
+/// verbatim string headers, for which RESP3 defines no chunk format.
+///
+/// `depth` is the remaining nesting budget, shared with counted aggregates:
+/// each streamed aggregate spends one unit before reading its elements.
+fn assemble_streamed(
+    input: &Bytes,
+    header: Frame,
+    pos: usize,
+    depth: u32,
+) -> Result<(Frame, usize), ParseError> {
     match header {
         Frame::StreamedStringHeader => {
-            // Parse streaming string chunks until zero-length chunk
+            // Chunks until the zero-length chunk; nothing else may appear.
             let mut chunks = Vec::new();
-
+            let mut cursor = pos;
             loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
+                let (frame, next) = parse_frame_inner(input, cursor, depth)?;
+                cursor = next;
                 match frame {
-                    Frame::StreamedStringChunk(chunk) => {
-                        if chunk.is_empty() {
-                            // Zero-length chunk indicates end of stream
-                            break;
-                        }
-                        chunks.push(chunk);
-                    }
-                    _ => {
-                        return Err(ParseError::InvalidFormat);
-                    }
+                    Frame::StreamedStringChunk(chunk) if chunk.is_empty() => break,
+                    Frame::StreamedStringChunk(chunk) => chunks.push(chunk),
+                    _ => return Err(ParseError::InvalidFormat),
                 }
             }
-
-            Ok((Frame::StreamedString(chunks), rest))
-        }
-        Frame::StreamedBlobErrorHeader | Frame::StreamedVerbatimStringHeader => {
-            // RESP3 does not define a streaming chunk format for blob errors
-            // or verbatim strings. Return the header as-is for low-level consumers.
-            Ok((header, rest))
+            Ok((Frame::StreamedString(chunks), cursor))
         }
         Frame::StreamedArrayHeader => {
-            // Parse streaming array items until terminator
-            let mut items = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::StreamTerminator => {
-                        break;
-                    }
-                    item => {
-                        items.push(item);
-                    }
-                }
-            }
-
-            Ok((Frame::StreamedArray(items), rest))
+            let (items, end) = parse_streamed_items(input, pos, depth)?;
+            Ok((Frame::StreamedArray(items), end))
         }
         Frame::StreamedSetHeader => {
-            // Parse streaming set items until terminator
-            let mut items = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::StreamTerminator => {
-                        break;
-                    }
-                    item => {
-                        items.push(item);
-                    }
-                }
-            }
-
-            Ok((Frame::StreamedSet(items), rest))
-        }
-        Frame::StreamedMapHeader => {
-            // Parse streaming map pairs until terminator
-            let mut pairs = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::StreamTerminator => {
-                        break;
-                    }
-                    key => {
-                        let (value, newer_rest) = parse_frame(rest)?;
-                        if matches!(value, Frame::StreamTerminator) {
-                            return Err(ParseError::InvalidFormat);
-                        }
-                        rest = newer_rest;
-                        pairs.push((key, value));
-                    }
-                }
-            }
-
-            Ok((Frame::StreamedMap(pairs), rest))
-        }
-        Frame::StreamedAttributeHeader => {
-            // Parse streaming attribute pairs until terminator
-            let mut pairs = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::StreamTerminator => {
-                        break;
-                    }
-                    key => {
-                        let (value, newer_rest) = parse_frame(rest)?;
-                        if matches!(value, Frame::StreamTerminator) {
-                            return Err(ParseError::InvalidFormat);
-                        }
-                        rest = newer_rest;
-                        pairs.push((key, value));
-                    }
-                }
-            }
-
-            Ok((Frame::StreamedAttribute(pairs), rest))
+            let (items, end) = parse_streamed_items(input, pos, depth)?;
+            Ok((Frame::StreamedSet(items), end))
         }
         Frame::StreamedPushHeader => {
-            // Parse streaming push items until terminator
-            let mut items = Vec::new();
-
-            loop {
-                let (frame, new_rest) = parse_frame(rest)?;
-                rest = new_rest;
-
-                match frame {
-                    Frame::StreamTerminator => {
-                        break;
-                    }
-                    item => {
-                        items.push(item);
-                    }
-                }
-            }
-
-            Ok((Frame::StreamedPush(items), rest))
+            let (items, end) = parse_streamed_items(input, pos, depth)?;
+            Ok((Frame::StreamedPush(items), end))
         }
-        _ => {
-            // Not a streaming sequence, just return the original frame
-            Ok((header, rest))
+        Frame::StreamedMapHeader => {
+            let (pairs, end) = parse_streamed_pairs(input, pos, depth)?;
+            Ok((Frame::StreamedMap(pairs), end))
+        }
+        Frame::StreamedAttributeHeader => {
+            let (pairs, end) = parse_streamed_pairs(input, pos, depth)?;
+            Ok((Frame::StreamedAttribute(pairs), end))
+        }
+        other => Ok((other, pos)),
+    }
+}
+
+/// Elements of a streamed array, set or push, up to and including `.`.
+fn parse_streamed_items(
+    input: &Bytes,
+    pos: usize,
+    depth: u32,
+) -> Result<(Vec<Frame>, usize), ParseError> {
+    let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
+    let mut items = Vec::new();
+    let mut cursor = pos;
+    loop {
+        let (item, next) = parse_streamed_element(input, cursor, child_depth)?;
+        cursor = next;
+        match item {
+            Some(item) => items.push(item),
+            None => return Ok((items, cursor)),
+        }
+    }
+}
+
+/// Key-value pairs of a streamed map or attribute, up to and including `.`.
+fn parse_streamed_pairs(
+    input: &Bytes,
+    pos: usize,
+    depth: u32,
+) -> Result<(Vec<(Frame, Frame)>, usize), ParseError> {
+    let child_depth = depth.checked_sub(1).ok_or(ParseError::DepthExceeded)?;
+    let mut pairs = Vec::new();
+    let mut cursor = pos;
+    loop {
+        let (key, next) = parse_streamed_element(input, cursor, child_depth)?;
+        let Some(key) = key else {
+            return Ok((pairs, next));
+        };
+        // The terminator in a value slot would leave the last key without one.
+        let (value, next) = parse_streamed_element(input, next, child_depth)?;
+        let value = value.ok_or(ParseError::InvalidFormat)?;
+        pairs.push((key, value));
+        cursor = next;
+    }
+}
+
+/// One element of a streamed aggregate, or `None` for its `.` terminator.
+///
+/// Attributes are skipped, as [`parse_element`] does for counted aggregates
+/// (#98): a counted one there, a streamed one (`|?`) here once assembled. An
+/// attribute directly before `.` describes nothing and is discarded. A streamed
+/// header is assembled with its body rather than returned bare, so its own
+/// terminator cannot close this container (#97).
+fn parse_streamed_element(
+    input: &Bytes,
+    pos: usize,
+    depth: u32,
+) -> Result<(Option<Frame>, usize), ParseError> {
+    let mut cursor = pos;
+    loop {
+        let (frame, next) = parse_element(input, cursor, depth)?;
+        if matches!(frame, Frame::StreamTerminator) {
+            return Ok((None, next));
+        }
+        let (frame, next) = assemble_streamed(input, frame, next, depth)?;
+        cursor = next;
+        if !matches!(frame, Frame::StreamedAttribute(_)) {
+            return Ok((Some(frame), cursor));
         }
     }
 }
@@ -1343,6 +1330,10 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
 /// ```
 ///
+/// For the assembled streaming frames (`StreamedString`, `StreamedArray` and
+/// the rest), the reader is [`parse_streaming_sequence`] instead, since
+/// `parse_frame` returns only their header.
+///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 /// What that catches, beyond the CRLF case:
@@ -1355,6 +1346,9 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// | `VerbatimString { payload: b"text:x" }` | `=6\r\ntext:x\r\n` | rejected |
 /// | `StreamedString` with an empty chunk | mid-stream `;0\r\n` | truncated |
 /// | `Attribute` inside an aggregate | slot skipped | one element short |
+/// | `StreamedAttribute` inside a streamed aggregate | slot skipped | one element short |
+/// | `StreamedArrayHeader` inside a streamed aggregate | `*?\r\n` | following elements read as its body |
+/// | `StreamedArray` inside a counted aggregate | `*?\r\n...` | bare header, body left over |
 ///
 /// # Scope
 ///
@@ -1409,10 +1403,11 @@ fn check_bulk_payload(payload: &[u8]) -> Result<(), SerializeError> {
     Ok(())
 }
 
-/// True for the six frames only [`parse_streaming_sequence`] produces, and only
-/// at the top level. `parse_frame` reads their wire form back as the bare
-/// header and leaves the body in the buffer, so nesting one desynchronizes the
-/// stream (#83).
+/// True for the six frames only [`parse_streaming_sequence`] produces, at the
+/// top level or as an element of another streamed aggregate. `parse_frame`
+/// reads their wire form back as the bare header and leaves the body in the
+/// buffer, so nesting one in a counted aggregate desynchronizes the stream
+/// (#83).
 #[inline]
 fn is_assembled_streaming(frame: &Frame) -> bool {
     matches!(
@@ -1428,20 +1423,30 @@ fn is_assembled_streaming(frame: &Frame) -> bool {
 
 /// Serialize one element of a STREAMED aggregate.
 ///
-/// The rules here are the opposite of [`try_serialize_element`]'s, which is why
-/// they are separate functions rather than one shared check. A streamed
-/// aggregate is terminated rather than counted, so a `StreamTerminator` inside
-/// it ends the container early (#84), while an `Attribute` is fine because
-/// there is no slot to consume. In a counted aggregate it is exactly reversed.
+/// The rules here differ from [`try_serialize_element`]'s, which is why they
+/// are separate functions rather than one shared check. A streamed aggregate is
+/// terminated rather than counted, so a `StreamTerminator` inside it ends the
+/// container early (#84), where in a counted one it is an ordinary element.
+/// [`parse_streaming_sequence`] assembles a streamed value found here, so an
+/// assembled streaming frame round-trips in this position and a bare streamed
+/// header does not: its body would be read as part of it (#97). Attributes,
+/// counted or streamed, are skipped by the parser as in a counted aggregate,
+/// so neither can be an element (#98).
 #[inline]
 fn try_serialize_streamed_element(frame: &Frame, buf: &mut BytesMut) -> Result<(), SerializeError> {
-    if matches!(frame, Frame::StreamTerminator) {
-        return Err(SerializeError::TerminatorInStreamedAggregate);
+    match frame {
+        Frame::StreamTerminator => Err(SerializeError::TerminatorInStreamedAggregate),
+        Frame::Attribute(_) | Frame::StreamedAttribute(_) => {
+            Err(SerializeError::AttributeInAggregate)
+        }
+        Frame::StreamedStringHeader
+        | Frame::StreamedArrayHeader
+        | Frame::StreamedSetHeader
+        | Frame::StreamedMapHeader
+        | Frame::StreamedAttributeHeader
+        | Frame::StreamedPushHeader => Err(SerializeError::StreamHeaderInStreamedAggregate),
+        _ => try_serialize_frame(frame, buf),
     }
-    if is_assembled_streaming(frame) {
-        return Err(SerializeError::NestedStreamingFrame);
-    }
-    try_serialize_frame(frame, buf)
 }
 
 /// Serialize one aggregate element. An attribute cannot occupy a slot, because
@@ -1509,6 +1514,10 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
             // truncates the stream in place.
             if chunks.iter().any(|c| c.is_empty()) {
                 return Err(SerializeError::EmptyStreamedChunk);
+            }
+            // Each chunk is length-prefixed and bounded like a bulk string.
+            for chunk in chunks {
+                check_bulk_payload(chunk)?;
             }
             serialize_frame(frame, buf);
         }
