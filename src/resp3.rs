@@ -1868,6 +1868,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<Frame>(), 40);
     }
     use super::{Frame, ParseError, Parser, frame_to_bytes, parse_frame, parse_streaming_sequence};
+    use alloc::vec;
+    use alloc::vec::Vec;
     use bytes::Bytes;
 
     #[test]

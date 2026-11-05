@@ -707,6 +707,7 @@ fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn simple_string() {
