@@ -16,10 +16,13 @@
 //!   The parser ends the line at the first CRLF pair, so a bare `\r` or `\n`
 //!   is read back as payload. The specs forbid both there, and
 //!   [`try_frame_to_bytes`] refuses to emit them (#99).
-//! - **Double parsing** accepts case-insensitive and non-canonical float spellings
-//!   (e.g., `INF`, `Infinity`, `NAN`) via Rust's `f64::parse`, then normalizes
+//! - **Double parsing** accepts `inf`, `-inf`, `nan` and `-nan` in any case,
+//!   which the spec tells clients to tolerate from older Redis, and normalizes
 //!   them to canonical [`Frame::SpecialFloat`] values (`inf`, `-inf`, `nan`).
-//!   This means roundtrip is semantic (value-preserving) but not lexical
+//!   Finite values go through Rust's `f64::parse`, so forms such as `.5`, `1.`
+//!   and `+1.5` are accepted although the RESP3 grammar excludes them. Other
+//!   non-finite text (`infinity`, `+inf`, an overflowing `1e309`) is rejected
+//!   (#103). Roundtrip is semantic (value-preserving) but not lexical
 //!   (byte-preserving) for non-canonical inputs.
 //! - **Push frames** are accepted in any position, although the spec says they
 //!   only appear at the top level. A nested push is returned as an element of
@@ -609,28 +612,50 @@ fn parse_bulk_string(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, us
     }
 }
 
+/// The canonical [`Frame::SpecialFloat`] spelling for a double's special
+/// value, or `None` if the text is not one.
+///
+/// `inf`, `-inf` and `nan` are the RESP3 spellings. `-nan` and case variants
+/// such as `NaN` and `-INF` are accepted too, because the spec tells clients to
+/// tolerate them from Redis before 7.2. `infinity`, `+inf` and `+nan` are not:
+/// Redis has never sent them (#103).
+#[inline]
+pub(crate) fn special_float(text: &[u8]) -> Option<&'static [u8]> {
+    if text.eq_ignore_ascii_case(b"inf") {
+        Some(b"inf")
+    } else if text.eq_ignore_ascii_case(b"-inf") {
+        Some(b"-inf")
+    } else if text.eq_ignore_ascii_case(b"nan") || text.eq_ignore_ascii_case(b"-nan") {
+        Some(b"nan")
+    } else {
+        None
+    }
+}
+
 /// Parse a double frame (`,`).
+///
+/// A special value from [`special_float`] becomes a [`Frame::SpecialFloat`].
+/// Anything else must parse to a finite `f64`: a literal that overflows to
+/// infinity, such as `1e309`, is rejected rather than turned into `inf`, as
+/// hiredis does (#103).
 #[inline(never)]
 fn parse_double_frame(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
     let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
     let line_bytes = &buf[pos + 1..line_end];
-    if line_bytes == b"inf" || line_bytes == b"-inf" || line_bytes == b"nan" {
-        return Ok((
-            Frame::SpecialFloat(input.slice(pos + 1..line_end)),
-            after_crlf,
-        ));
+    if let Some(canonical) = special_float(line_bytes) {
+        let frame = if line_bytes == canonical {
+            Frame::SpecialFloat(input.slice(pos + 1..line_end))
+        } else {
+            Frame::SpecialFloat(Bytes::from_static(canonical))
+        };
+        return Ok((frame, after_crlf));
     }
     let s = core::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
     let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
-    if v.is_infinite() || v.is_nan() {
-        let canonical = if v.is_nan() {
-            "nan"
-        } else if v.is_sign_negative() {
-            "-inf"
-        } else {
-            "inf"
-        };
-        return Ok((Frame::SpecialFloat(Bytes::from(canonical)), after_crlf));
+    // `str::parse` also accepts `infinity`, `+inf`, `+nan` and overflowing
+    // literals; everything non-finite that reaches here is one of those.
+    if !v.is_finite() {
+        return Err(ParseError::InvalidFormat);
     }
     Ok((Frame::Double(v), after_crlf))
 }

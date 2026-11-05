@@ -1572,3 +1572,88 @@ fn checked_serializer_refuses_a_plus_signed_big_number() {
     );
     assert!(resp3::try_frame_to_bytes(&Frame::BigNumber(Bytes::from_static(b"-123"))).is_ok());
 }
+
+#[test]
+fn double_special_values_and_tolerated_variants() {
+    // #103. The spec's spellings, plus `-nan` and case variants, which it says
+    // clients must tolerate from Redis before 7.2.
+    for (wire, want) in [
+        (&b",inf\r\n"[..], &b"inf"[..]),
+        (b",-inf\r\n", b"-inf"),
+        (b",nan\r\n", b"nan"),
+        (b",-nan\r\n", b"nan"),
+        (b",INF\r\n", b"inf"),
+        (b",Inf\r\n", b"inf"),
+        (b",-INF\r\n", b"-inf"),
+        (b",NaN\r\n", b"nan"),
+        (b",NAN\r\n", b"nan"),
+        (b",-NaN\r\n", b"nan"),
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        assert_eq!(
+            frame,
+            Frame::SpecialFloat(Bytes::copy_from_slice(want)),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn double_rejects_other_non_finite_text() {
+    // #103. `str::parse` accepts all of these; Redis never sends them, and
+    // hiredis rejects them. An overflowing literal is not quietly `inf`.
+    for wire in [
+        &b",infinity\r\n"[..],
+        &b",Infinity\r\n"[..],
+        &b",-infinity\r\n"[..],
+        &b",+inf\r\n"[..],
+        &b",+INF\r\n"[..],
+        &b",+nan\r\n"[..],
+        &b",+infinity\r\n"[..],
+        &b",1e309\r\n"[..],
+        &b",-1e309\r\n"[..],
+        &b",179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792\r\n"[..],
+        &b",nan(0x1)\r\n"[..],
+        &b",in\r\n"[..],
+    ] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn double_finite_forms_unchanged() {
+    // #103 option 2 leaves these alone, although the RESP3 grammar excludes the
+    // ones without integral and fractional digits on both sides.
+    for (wire, want) in [
+        (&b",1.5\r\n"[..], 1.5f64),
+        (b",-0.0\r\n", -0.0),
+        (b",1e308\r\n", 1e308),
+        (b",5e-324\r\n", 5e-324),
+        (b",1e-400\r\n", 0.0),
+        (b",.5\r\n", 0.5),
+        (b",1.\r\n", 1.0),
+        (b",+1.5\r\n", 1.5),
+        (b",01.5\r\n", 1.5),
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        match frame {
+            Frame::Double(v) => assert_eq!(
+                v.to_bits(),
+                want.to_bits(),
+                "{}",
+                String::from_utf8_lossy(wire)
+            ),
+            other => panic!("{}: {other:?}", String::from_utf8_lossy(wire)),
+        }
+    }
+}
