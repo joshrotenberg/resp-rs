@@ -96,7 +96,7 @@ fn is_resource_limit(e: &ParseError) -> bool {
 /// not checked in the we-reject-they-accept direction. Frames built only from
 /// `+` `-` `:` `*` are still checked. That is the direction that caught #49,
 /// where the reference reads `:+42\r\n` as 42 and this crate refused the sign;
-/// since #102 refusing it is deliberate, and `has_noncanonical_number` excuses
+/// since #102 refusing it is deliberate, and `has_rejected_line_text` excuses
 /// exactly that case.
 fn bulk_laxness_may_apply(data: &[u8], consumed: usize) -> bool {
     data[..consumed.min(data.len())].contains(&b'$')
@@ -114,19 +114,22 @@ fn ours_holds_non_utf8_error(f: &resp2::Frame) -> bool {
     }
 }
 
-/// True if the frame the reference accepted spells a `:` integer
-/// non-canonically: a `+` sign, a leading zero, or `-0`.
+/// True if the frame the reference accepted holds line text this crate rejects
+/// with `InvalidFormat` by design, where redis-protocol accepts it:
 ///
-/// Redis and hiredis reject these (`string2ll`), and so does this crate since
-/// #101 and #102, with `InvalidFormat`; redis-protocol accepts them. The frame
-/// is walked header by header over the bytes the reference consumed, so a `+`
-/// or `0` inside a simple string or bulk payload excuses nothing. `$` and `*`
-/// headers are walked only to find the integers: a rejected length or count is
-/// `BadLength`, which `is_resource_limit` already excuses.
+/// - a `:` integer spelled non-canonically: a `+` sign, a leading zero, or `-0`
+///   (#101, #102; Redis and hiredis reject these with `string2ll`);
+/// - a bare `\r` or `\n` in a `+` simple string or `-` error (#99; the specs
+///   forbid them and hiredis rejects them).
 ///
-/// Known limit: a wrongly rejected canonical integer in the same frame as a
-/// non-canonical one is excused too.
-fn has_noncanonical_number(data: &[u8], consumed: usize) -> bool {
+/// The frame is walked header by header over the bytes the reference consumed,
+/// so these bytes inside a bulk payload excuse nothing. `$` and `*` headers are
+/// walked only to reach the lines: a rejected length or count is `BadLength`,
+/// which `is_resource_limit` already excuses.
+///
+/// Known limit: a wrongly rejected canonical line in the same frame as one of
+/// these is excused too.
+fn has_rejected_line_text(data: &[u8], consumed: usize) -> bool {
     fn line(data: &[u8], pos: usize) -> Option<(&[u8], usize)> {
         let rel = data.get(pos..)?.windows(2).position(|w| w == b"\r\n")?;
         Some((&data[pos..pos + rel], pos + rel + 2))
@@ -136,8 +139,7 @@ fn has_noncanonical_number(data: &[u8], consumed: usize) -> bool {
         text.first() == Some(&b'+')
             || (digits.first() == Some(&b'0') && (digits.len() > 1 || digits.len() != text.len()))
     }
-    // Returns whether a non-canonical integer was found, and where the frame
-    // ends. `None` (no excuse) past MAX_DEPTH, which this crate rejects anyway.
+    // Returns whether rejected line text was found, and where the frame ends. `None` (no excuse) past MAX_DEPTH, which this crate rejects anyway.
     fn walk(data: &[u8], pos: usize, depth: u32) -> Option<(bool, usize)> {
         if depth > resp2::MAX_DEPTH {
             return None;
@@ -145,7 +147,7 @@ fn has_noncanonical_number(data: &[u8], consumed: usize) -> bool {
         let tag = *data.get(pos)?;
         let (text, next) = line(data, pos + 1)?;
         match tag {
-            b'+' | b'-' => Some((false, next)),
+            b'+' | b'-' => Some((text.iter().any(|&b| b == b'\r' || b == b'\n'), next)),
             b':' => Some((noncanonical(text), next)),
             b'$' => {
                 let n: i64 = core::str::from_utf8(text).ok()?.parse().ok()?;
@@ -233,13 +235,14 @@ fuzz_target!(|data: &[u8]| {
         // is exactly how issue #49 would have been caught: the reference reads
         // `:+42\r\n` as 42 while this crate used to refuse the sign. Since
         // #102 refusing it is deliberate again, matching Redis and hiredis, so
-        // non-canonical number text is excused by walking the frame for it.
+        // that and a bare CR or LF in a line (#99) are excused by walking the
+        // frame for them.
         (Err(e), Ok(Some((their_frame, their_consumed)))) => {
             assert!(
                 is_resource_limit(e)
                     || bulk_laxness_may_apply(data, *their_consumed)
                     || (*e == ParseError::InvalidFormat
-                        && has_noncanonical_number(data, *their_consumed)),
+                        && has_rejected_line_text(data, *their_consumed)),
                 "we reject what the reference accepts\n  input:  {data:?}\n  ours:   {e:?}\n  theirs: {their_frame:?}"
             );
         }

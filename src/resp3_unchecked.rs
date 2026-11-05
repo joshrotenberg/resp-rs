@@ -393,10 +393,7 @@ mod tests {
             "*?\r\n",
             ";5\r\nhello\r\n",
             ";0\r\n",
-            // Bare CR inside a payload is data, not a line terminator (#65).
-            "+a\rb\r\n",
-            "-a\rb\r\n",
-            "*2\r\n+a\rZ+b\r\n+x\r\n",
+            // The bare-CR payloads from #65 were here; invalid input since #99.
         ];
 
         for wire in cases {

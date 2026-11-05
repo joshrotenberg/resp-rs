@@ -17,9 +17,8 @@
 //! # Protocol permissiveness
 //!
 //! Simple strings and errors are treated as raw bytes, not validated UTF-8.
-//! The parser ends the line at the first CRLF pair, so a bare `\r` or `\n` is
-//! read back as payload. The specs forbid both there, and
-//! [`try_frame_to_bytes`] refuses to emit them (#99).
+//! Any byte other than `\r` and `\n` is accepted; the specs forbid both there,
+//! and the parser and [`try_frame_to_bytes`] refuse them (#99).
 //! This is intentional for zero-copy operation and compatibility with
 //! servers that may send non-UTF-8 data in these fields.
 
@@ -215,14 +214,14 @@ pub(crate) fn parse_frame_inner(
 
     match tag {
         b'+' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let (line_end, after_crlf) = find_simple_line(buf, pos + 1)?;
             Ok((
                 Frame::SimpleString(input.slice(pos + 1..line_end)),
                 after_crlf,
             ))
         }
         b'-' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let (line_end, after_crlf) = find_simple_line(buf, pos + 1)?;
             Ok((Frame::Error(input.slice(pos + 1..line_end)), after_crlf))
         }
         b':' => {
@@ -358,10 +357,6 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
 /// ```
 ///
-/// One deliberate exception: a bare `\r` or `\n` in a simple string or error
-/// payload is refused although this crate's parser reads it back, because the
-/// specs forbid it there and peers such as hiredis reject it (#99).
-///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 ///
@@ -404,10 +399,8 @@ pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
 
 /// Reject a line payload containing a CR or LF.
 ///
-/// A CRLF pair would terminate the frame early. A bare `\r` or `\n` reads
-/// back through [`find_crlf`], which scans for the pair, but the specs forbid
-/// both in these lines and hiredis rejects them, so emitting one breaks other
-/// peers (#99).
+/// A CRLF pair would terminate the frame early, and the parser rejects a bare
+/// `\r` or `\n` in these lines, as the specs and hiredis do (#99).
 #[inline]
 fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
     if payload.iter().any(|&b| b == b'\r' || b == b'\n') {
@@ -626,6 +619,35 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
         // later could bring it back into range. Reporting that rather than
         // `Incomplete` is what lets `Parser` drop the buffer instead of growing
         // it for as long as the peer keeps sending.
+        return Err(ParseError::LineTooLong);
+    }
+    Err(ParseError::Incomplete)
+}
+
+/// [`find_crlf`] for simple strings and errors, whose payload may not contain
+/// a CR or LF at all (#99).
+///
+/// One pass: a `\r\n` pair ends the line, and any other `\r` or `\n` is
+/// `InvalidFormat`, except a `\r` as the last buffered byte, whose `\n` may
+/// still arrive. The specs forbid both bytes here and hiredis rejects them.
+#[inline]
+fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
+    let len = buf.len();
+    let mut i = from;
+    while i < len {
+        match buf[i] {
+            b'\r' if i + 1 == len => break,
+            b'\r' if buf[i + 1] == b'\n' => {
+                if i - from > MAX_LINE_LENGTH {
+                    return Err(ParseError::LineTooLong);
+                }
+                return Ok((i, i + 2));
+            }
+            b'\r' | b'\n' => return Err(ParseError::InvalidFormat),
+            _ => i += 1,
+        }
+    }
+    if len - from > MAX_LINE_LENGTH {
         return Err(ParseError::LineTooLong);
     }
     Err(ParseError::Incomplete)

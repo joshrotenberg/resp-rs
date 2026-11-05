@@ -1529,22 +1529,36 @@ fn bare_cr_or_lf_in_every_line_position_is_refused() {
 }
 
 #[test]
-fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
-    // The checked serializer is stricter than the parser here until the parser
-    // side of #99 lands in 0.4. If this starts failing, the exception in the
-    // try_frame_to_bytes docs and the iff property tests can go.
-    for (wire, frame) in [
-        (&b"+a\rb\r\n"[..], simple("a\rb")),
-        (b"+a\nb\r\n", simple("a\nb")),
-        (
-            b"-ERR a\nb\r\n",
-            Frame::Error(Bytes::from_static(b"ERR a\nb")),
-        ),
+fn parser_rejects_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid both in simple strings and errors, and hiredis
+    // rejects them. Until 0.4 the parser read them back as payload.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"+a\nb\r\n"[..],
+        &b"+a\r\r\n"[..],
+        &b"+\n\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"-ERR a\rb\r\n"[..],
+        &b"*2\r\n+ok\r\n+a\rb\r\n"[..],
+        // No terminator yet, but a bare LF can never become valid.
+        &b"+a\nb"[..],
+        &b"+a\rb"[..],
     ] {
-        let (parsed, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire)).unwrap();
-        assert_eq!(parsed, frame);
-        assert!(rest.is_empty());
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{:?}",
+            Bytes::copy_from_slice(wire)
+        );
     }
+    // A CR as the last buffered byte may be the start of the terminator.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"+abc\r")),
+        Err(ParseError::Incomplete)
+    );
+    // Other line types are unaffected: a bulk string carries any bytes.
+    let (frame, _) = resp3::parse_frame(Bytes::from_static(b"$3\r\na\rb\r\n")).unwrap();
+    assert_eq!(frame, Frame::BulkString(Some(Bytes::from_static(b"a\rb"))));
 }
 
 #[test]

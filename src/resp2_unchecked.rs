@@ -218,14 +218,9 @@ mod tests {
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
             "*2\r\n*1\r\n:1\r\n+OK\r\n",
-            // Bare CR inside a payload is data, not a line terminator. These
-            // desynchronized the unchecked cursor before issue #65: the first
-            // gave a silently wrong result, the second reached
-            // unreachable_unchecked and aborted.
-            "+a\rb\r\n",
-            "-a\rb\r\n",
-            "*2\r\n+a\rZ+b\r\n+x\r\n",
-            "*2\r\n+a\rb\r\n+x\r\n",
+            // The bare-CR payloads from #65 were here. A bare CR in a simple
+            // string or error is invalid input since #99, so the safe parser
+            // rejects them and they are outside this parser's contract.
             // `:+0` and `:+42` were here for #77, while the safe parser
             // accepted a `+` sign. It rejects one since #102, so they are no
             // longer valid input for either parser.

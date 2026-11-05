@@ -500,9 +500,9 @@ pub enum SerializeError {
     ///
     /// A CRLF pair would terminate the frame early and let the remainder be
     /// read as further frames. A bare `\r` or `\n` is also refused: the RESP2
-    /// and RESP3 specs forbid both in these lines and hiredis rejects them,
-    /// although this crate's parser still reads them back. To send text that
-    /// may contain them, replace them first, as Redis maps each to a space.
+    /// and RESP3 specs forbid both in these lines, and hiredis and this crate's
+    /// parser reject them. To send text that may contain them, replace them
+    /// first, as Redis maps each to a space.
     #[error("line payload contains CR or LF")]
     LineContainsCrlf,
 
