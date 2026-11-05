@@ -220,6 +220,22 @@ cargo bench
 
 ## Upgrading
 
+### 0.3 to 0.4
+
+Integers, lengths and counts accept only their canonical spelling, as Redis and
+hiredis do:
+
+| Input | 0.3 | 0.4 |
+| --- | --- | --- |
+| `:+1\r\n` | `Integer(1)` | `ParseError::InvalidFormat` |
+| `:01\r\n`, `:-0\r\n` | `Integer(1)`, `Integer(0)` | `ParseError::InvalidFormat` |
+| `$03\r\nfoo\r\n`, `*01\r\n...` | parsed | `ParseError::BadLength` |
+
+The same applies to blob error, verbatim string and streamed chunk lengths and
+to set, map, attribute and push counts. `$-1` and `*-1` are unchanged. The
+serializer has always emitted the canonical form, so frames produced by this
+crate are unaffected.
+
 ### 0.3.1 to 0.3.2
 
 `try_frame_to_bytes` in both protocols, and so the `Codec` encoders, now refuse

@@ -42,13 +42,14 @@ unsafe fn find_cr(buf: &[u8], from: usize) -> usize {
 /// # Safety
 ///
 /// Caller must ensure `buf` contains only ASCII digits, optionally preceded
-/// by `+` or `-`, and is non-empty.
+/// by `-`, and is non-empty.
 #[inline(always)]
 unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
     let mut i = 0;
-    // Both signs, mirroring the safe parser. Missing `+` here does not merely
-    // reject: the byte stays in the digit run and `b'+' - b'0'` wraps, so
-    // `:+0\r\n` decoded as 2510 (issue #77).
+    // Only `-` is valid input since #102, but a `+` is still skipped: left in
+    // the digit run, `b'+' - b'0'` wraps, so `:+0\r\n` decoded as 2510 and
+    // panicked under debug assertions (issue #77). A contract violation should
+    // give a wrong value, not that.
     let first = *buf.get_unchecked(0);
     let neg = first == b'-';
     if neg || first == b'+' {
@@ -193,6 +194,15 @@ mod tests {
     use crate::resp2;
 
     #[test]
+    fn plus_sign_is_skipped_not_wrapped() {
+        // Outside the contract since #102, but the `+` skip from #77 stays so
+        // that a contract violation gives a value rather than a wrapped byte
+        // (2510 for `:+0`, or a panic under debug assertions).
+        let (frame, _) = unsafe { parse_frame_unchecked(Bytes::from_static(b":+0\r\n")) };
+        assert_eq!(frame, Frame::Integer(0));
+    }
+
+    #[test]
     fn unchecked_matches_safe() {
         let cases = vec![
             "+OK\r\n",
@@ -216,18 +226,17 @@ mod tests {
             "-a\rb\r\n",
             "*2\r\n+a\rZ+b\r\n+x\r\n",
             "*2\r\n+a\rb\r\n+x\r\n",
-            // An explicit plus sign. The safe parser accepted these from #56
-            // while this one still stripped only `-`, leaving `+` in the digit
-            // run where `b'+' - b'0'` wrapped: `:+0\r\n` decoded as 2510
-            // (issue #77).
-            ":+0\r\n",
-            ":+42\r\n",
+            // `:+0` and `:+42` were here for #77, while the safe parser
+            // accepted a `+` sign. It rejects one since #102, so they are no
+            // longer valid input for either parser.
+            ":0\r\n",
+            ":-1\r\n",
             // i64::MIN. Building the magnitude positively overflows on exactly
             // this value; in release the overflows cancel, under
             // debug-assertions it panicked (found by fuzz_unchecked on main).
             ":-9223372036854775808\r\n",
             ":9223372036854775807\r\n",
-            "*2\r\n:+1\r\n:-1\r\n",
+            "*2\r\n:1\r\n:-1\r\n",
         ];
 
         for wire in cases {

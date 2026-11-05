@@ -342,20 +342,26 @@ fn parser_rejects_deep_nesting() {
     assert_eq!(parser.next_frame(), Err(ParseError::DepthExceeded));
 }
 
-// --- Integer sign and classification (issues #49, #55) ---
+// --- Canonical integers, lengths and counts (issues #49, #55, #101, #102) ---
 //
-// These cases are transcribed from the RESP grammar `:[<+|->]<value>\r\n`,
-// not from frame_to_bytes. The serializer emits i64 via Display, which never
-// produces a leading `+`, so no test whose input comes from the serializer can
-// reach the signed form. That closed loop is why #49 went unnoticed.
+// Transcribed by hand rather than from frame_to_bytes, which emits only the
+// canonical form, so no test whose input comes from the serializer can reach
+// the others. That closed loop is why #49 went unnoticed.
+//
+// The accepted grammar is what Redis and hiredis accept (`string2ll`): an
+// optional `-` on integers, no `+`, no leading zero unless the value is 0, and
+// no `-0`. Lengths and counts take no sign at all, except the `-1` null forms.
 
 #[test]
-fn integer_accepts_explicit_plus() {
+fn integer_canonical_forms_parse() {
     for (wire, want) in [
-        (&b":+42\r\n"[..], 42i64),
-        (&b":+0\r\n"[..], 0),
-        (&b":+1\r\n"[..], 1),
-        (&b":+9223372036854775807\r\n"[..], i64::MAX),
+        (&b":0\r\n"[..], 0i64),
+        (&b":7\r\n"[..], 7),
+        (&b":10\r\n"[..], 10),
+        (&b":-1\r\n"[..], -1),
+        (&b":-42\r\n"[..], -42),
+        (&b":9223372036854775807\r\n"[..], i64::MAX),
+        (&b":-9223372036854775808\r\n"[..], i64::MIN),
     ] {
         let (frame, rest) = resp2::parse_frame(Bytes::copy_from_slice(wire))
             .unwrap_or_else(|e| panic!("{:?}: {e:?}", String::from_utf8_lossy(wire)));
@@ -370,21 +376,28 @@ fn integer_accepts_explicit_plus() {
 }
 
 #[test]
-fn integer_sign_forms_agree() {
-    // The three spellings of the same value must parse identically.
-    let plus = resp2::parse_frame(Bytes::from_static(b":+42\r\n"))
-        .unwrap()
-        .0;
-    let bare = resp2::parse_frame(Bytes::from_static(b":42\r\n"))
-        .unwrap()
-        .0;
-    assert_eq!(plus, bare);
-    assert_eq!(
-        resp2::parse_frame(Bytes::from_static(b":-42\r\n"))
-            .unwrap()
-            .0,
-        Frame::Integer(-42)
-    );
+fn integer_rejects_non_canonical_forms() {
+    // #102: a `+` sign, accepted from #49. #101: leading zeros and `-0`.
+    for wire in [
+        &b":+0\r\n"[..],
+        &b":+1\r\n"[..],
+        &b":+42\r\n"[..],
+        &b":+9223372036854775807\r\n"[..],
+        &b":00\r\n"[..],
+        &b":01\r\n"[..],
+        &b":007\r\n"[..],
+        &b":-0\r\n"[..],
+        &b":-00\r\n"[..],
+        &b":-01\r\n"[..],
+        &b":09223372036854775807\r\n"[..],
+    ] {
+        assert_eq!(
+            resp2::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
 }
 
 #[test]
@@ -395,6 +408,7 @@ fn integer_rejects_malformed_signs() {
         &b":++1\r\n"[..],
         &b":+-1\r\n"[..],
         &b":-+1\r\n"[..],
+        &b":--1\r\n"[..],
         &b":1+\r\n"[..],
         &b":+ 1\r\n"[..],
     ] {
@@ -408,17 +422,67 @@ fn integer_rejects_malformed_signs() {
 }
 
 #[test]
-fn integer_signed_overflow_matches_unsigned() {
-    // Accepting the sign moves this from InvalidFormat to Overflow, which is
-    // the point: it should classify the same as the unsigned spelling.
-    assert_eq!(
-        resp2::parse_frame(Bytes::from_static(b":+9223372036854775808\r\n")),
-        Err(ParseError::Overflow)
-    );
+fn integer_overflow_and_sign_order() {
     assert_eq!(
         resp2::parse_frame(Bytes::from_static(b":9223372036854775808\r\n")),
         Err(ParseError::Overflow)
     );
+    // The sign is rejected before the range is considered.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b":+9223372036854775808\r\n")),
+        Err(ParseError::InvalidFormat)
+    );
+}
+
+#[test]
+fn non_canonical_integer_inside_an_aggregate_is_rejected() {
+    for wire in [&b"*1\r\n:+42\r\n"[..], &b"*2\r\n:1\r\n:01\r\n"[..]] {
+        assert_eq!(
+            resp2::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn lengths_and_counts_reject_non_canonical_forms() {
+    for wire in [
+        &b"$+5\r\nhello\r\n"[..],
+        &b"*+1\r\n:1\r\n"[..],
+        &b"$05\r\nhello\r\n"[..],
+        &b"$00\r\n\r\n"[..],
+        &b"$-0\r\n"[..],
+        &b"$-01\r\n"[..],
+        &b"*01\r\n:1\r\n"[..],
+        &b"*00\r\n"[..],
+        &b"*-0\r\n"[..],
+        &b"$00000000000000001024\r\n"[..],
+    ] {
+        assert_eq!(
+            resp2::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::BadLength),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn canonical_lengths_and_counts_parse() {
+    for wire in [
+        &b"$0\r\n\r\n"[..],
+        &b"$10\r\n0123456789\r\n"[..],
+        &b"$-1\r\n"[..],
+        &b"*0\r\n"[..],
+        &b"*-1\r\n"[..],
+        &b"*10\r\n:0\r\n:1\r\n:2\r\n:3\r\n:4\r\n:5\r\n:6\r\n:7\r\n:8\r\n:9\r\n"[..],
+    ] {
+        let (_, rest) = resp2::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{:?}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty(), "{}", String::from_utf8_lossy(wire));
+    }
 }
 
 #[test]
@@ -443,27 +507,6 @@ fn trailing_junk_is_malformed_not_overflow() {
     assert_eq!(
         resp2::parse_frame(Bytes::from_static(b":-9223372036854775809\r\n")),
         Err(ParseError::Overflow)
-    );
-}
-
-#[test]
-fn signed_integer_inside_an_aggregate() {
-    // The failure previously took the enclosing frame with it.
-    let (frame, _) = resp2::parse_frame(Bytes::from_static(b"*1\r\n:+42\r\n")).unwrap();
-    assert_eq!(frame, Frame::Array(Some(vec![Frame::Integer(42)])));
-}
-
-#[test]
-fn lengths_and_counts_still_reject_a_plus() {
-    // The sign is part of the integer grammar only. Lengths and counts have no
-    // sign, so a leading `+` must stay rejected there.
-    assert_eq!(
-        resp2::parse_frame(Bytes::from_static(b"$+5\r\nhello\r\n")),
-        Err(ParseError::BadLength)
-    );
-    assert_eq!(
-        resp2::parse_frame(Bytes::from_static(b"*+1\r\n:1\r\n")),
-        Err(ParseError::BadLength)
     );
 }
 
@@ -598,4 +641,12 @@ fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
         assert_eq!(parsed, frame);
         assert!(rest.is_empty());
     }
+}
+
+#[test]
+fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::from_static(b"*01\r\n:1\r\n+next\r\n"));
+    assert_eq!(parser.next_frame(), Err(ParseError::BadLength));
+    assert_eq!(parser.next_frame(), Ok(None));
 }

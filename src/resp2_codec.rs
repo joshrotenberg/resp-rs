@@ -255,6 +255,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_non_canonical_numbers() {
+        // #101, #102: the codec shares the parser's number grammar.
+        for (wire, want) in [
+            (&b":+1\r\n"[..], ParseError::InvalidFormat),
+            (&b":01\r\n"[..], ParseError::InvalidFormat),
+            (&b"$03\r\nfoo\r\n"[..], ParseError::BadLength),
+        ] {
+            let mut codec = Codec::new();
+            let mut buf = BytesMut::from(wire);
+            assert!(
+                matches!(codec.decode(&mut buf), Err(CodecError::Parse(ref e)) if *e == want),
+                "{:?}",
+                Bytes::copy_from_slice(wire)
+            );
+            // The buffered bytes are discarded with the error.
+            assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        }
+    }
+
+    #[test]
     fn encode_refuses_a_bare_cr_or_lf_in_a_line_payload() {
         // #99. These parse back here but the specs forbid them and hiredis
         // rejects them, so a reply echoing user input must not carry one.

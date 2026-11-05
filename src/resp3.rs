@@ -1234,9 +1234,13 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
 }
 
 /// Parse a `usize` directly from ASCII digit bytes, no UTF-8 validation needed.
+///
+/// Canonical form only: no sign, and no leading zero unless the value is `0`.
+/// Redis and hiredis reject the other spellings, and accepting them meant a
+/// frame did not serialize back to the bytes it was read from (#101).
 #[inline]
 fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
-    if buf.is_empty() {
+    if buf.is_empty() || (buf[0] == b'0' && buf.len() > 1) {
         return Err(ParseError::BadLength);
     }
     let mut v: usize = 0;
@@ -1254,9 +1258,10 @@ fn parse_usize(buf: &[u8]) -> Result<usize, ParseError> {
 
 /// Parse an `i64` directly from ASCII bytes, no UTF-8 validation.
 ///
-/// The sign is optional and may be `+` or `-`, matching the grammar
-/// `:[<+|->]<value>\r\n`. Redis does not emit the `+` form, but the spec
-/// allows it and other peers do.
+/// Canonical form only: an optional `-`, then digits with no leading zero
+/// unless the value is `0`, and no `-0`. This is what Redis and hiredis accept
+/// (`string2ll`), and the only spelling the serializer emits. A `+` sign was
+/// accepted from #49 until #102.
 #[inline]
 fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
     if buf.is_empty() {
@@ -1264,10 +1269,10 @@ fn parse_i64(buf: &[u8]) -> Result<i64, ParseError> {
     }
     let (neg, digits) = match buf[0] {
         b'-' => (true, &buf[1..]),
-        b'+' => (false, &buf[1..]),
         _ => (false, buf),
     };
-    if digits.is_empty() {
+    // Rejects `-`, a leading zero such as `01` or `-01`, and `-0`.
+    if digits.is_empty() || (digits[0] == b'0' && (neg || digits.len() > 1)) {
         return Err(ParseError::InvalidFormat);
     }
     // Validate the whole run before accumulating. Deciding this per iteration
