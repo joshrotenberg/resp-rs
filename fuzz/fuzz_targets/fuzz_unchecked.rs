@@ -34,20 +34,24 @@ fuzz_target!(|input: &[u8]| {
             };
             // SAFETY: parse_frame just accepted this buffer, which is exactly
             // the contract parse_frame_unchecked documents.
-            let (unchecked_frame, unchecked_rest) =
-                unsafe { resp2::parse_frame_unchecked(bytes) };
+            let (unchecked_frame, unchecked_rest) = unsafe { resp2::parse_frame_unchecked(bytes) };
             assert_eq!(safe_frame, unchecked_frame, "frames differ: {data:?}");
-            assert_eq!(safe_rest, unchecked_rest, "consumed lengths differ: {data:?}");
+            assert_eq!(
+                safe_rest, unchecked_rest,
+                "consumed lengths differ: {data:?}"
+            );
         }
         _ => {
             let Ok((safe_frame, safe_rest)) = resp3::parse_frame(bytes.clone()) else {
                 return;
             };
             // SAFETY: as above.
-            let (unchecked_frame, unchecked_rest) =
-                unsafe { resp3::parse_frame_unchecked(bytes) };
+            let (unchecked_frame, unchecked_rest) = unsafe { resp3::parse_frame_unchecked(bytes) };
             assert_eq!(safe_frame, unchecked_frame, "frames differ: {data:?}");
-            assert_eq!(safe_rest, unchecked_rest, "consumed lengths differ: {data:?}");
+            assert_eq!(
+                safe_rest, unchecked_rest,
+                "consumed lengths differ: {data:?}"
+            );
         }
     }
 });

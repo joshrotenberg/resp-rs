@@ -103,7 +103,9 @@ fn norm_ours(f: &resp3::Frame) -> Norm {
         F::Push(v) => Norm::Push(v.iter().map(norm_ours).collect()),
         F::Set(v) => Norm::Set(sorted_set(v.iter().map(norm_ours).collect())),
         F::Map(v) | F::Attribute(v) => Norm::Map(sorted_map(
-            v.iter().map(|(k, x)| (norm_ours(k), norm_ours(x))).collect(),
+            v.iter()
+                .map(|(k, x)| (norm_ours(k), norm_ours(x)))
+                .collect(),
         )),
         F::StreamedStringChunk(b) => Norm::Chunk(b.to_vec()),
         F::StreamTerminator => Norm::Chunk(Vec::new()),
@@ -145,7 +147,9 @@ fn norm_theirs(f: &TheirFrame) -> Norm {
         T::Push { data, .. } => Norm::Push(data.iter().map(norm_theirs).collect()),
         T::Set { data, .. } => Norm::Set(sorted_set(data.iter().map(norm_theirs).collect())),
         T::Map { data, .. } => Norm::Map(sorted_map(
-            data.iter().map(|(k, v)| (norm_theirs(k), norm_theirs(v))).collect(),
+            data.iter()
+                .map(|(k, v)| (norm_theirs(k), norm_theirs(v)))
+                .collect(),
         )),
         T::ChunkedString(v) => Norm::Chunk(v.clone()),
         // Gated before normalization reaches here (A11).
@@ -362,7 +366,9 @@ fuzz_target!(|data: &[u8]| {
         (Err(_), Ok(Some(_))) => {}
 
         (Ok((our_frame, _)), Ok(None)) => {
-            panic!("we accept a frame the reference considers incomplete\n  input: {data:?}\n  ours:  {our_frame:?}");
+            panic!(
+                "we accept a frame the reference considers incomplete\n  input: {data:?}\n  ours:  {our_frame:?}"
+            );
         }
     }
 });

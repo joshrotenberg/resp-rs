@@ -41,6 +41,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # fuzz/ is its own crate, outside the workspace, so --all does not reach it.
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
   clippy:
     name: Clippy
