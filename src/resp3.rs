@@ -524,7 +524,7 @@ pub fn parse_frame(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
 
 /// Parse a length-prefixed blob: shared logic for bulk string, blob error, and
 /// streamed string chunks. Returns `(data_start, data_end, after_crlf)` on success.
-#[inline(never)]
+#[inline]
 fn parse_blob_bounds(
     buf: &[u8],
     after_crlf: usize,
@@ -552,6 +552,7 @@ fn parse_blob_bounds(
 }
 
 /// Parse a bulk string frame (`$`).
+#[inline]
 fn parse_bulk_string(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
     let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
     let len_bytes = &buf[pos + 1..line_end];
@@ -768,12 +769,32 @@ fn check_big_number(payload: &[u8]) -> Result<(), ParseError> {
 ///
 /// A bare attribute parsed on its own is unaffected and still yields
 /// [`Frame::Attribute`]; only the in-aggregate position is handled here.
+///
+/// Only a `|` tag can start an attribute, so the tag byte is checked before
+/// parsing. Every other element goes straight to [`parse_frame_inner`], which
+/// keeps the common path free of a post-parse inspection of the frame.
 #[inline]
 fn parse_element(input: &Bytes, pos: usize, depth: u32) -> Result<(Frame, usize), ParseError> {
+    if input.as_ref().get(pos) == Some(&b'|') {
+        return parse_element_after_attributes(input, pos, depth);
+    }
+    parse_frame_inner(input, pos, depth)
+}
+
+/// The rare path of [`parse_element`]: skip one or more leading attributes.
+#[cold]
+#[inline(never)]
+fn parse_element_after_attributes(
+    input: &Bytes,
+    pos: usize,
+    depth: u32,
+) -> Result<(Frame, usize), ParseError> {
     let mut cursor = pos;
     loop {
         let (frame, next) = parse_frame_inner(input, cursor, depth)?;
         cursor = next;
+        // `|?` is a streamed attribute header, not an attribute: it is the
+        // element, exactly as before the tag check existed.
         if !matches!(frame, Frame::Attribute(_)) {
             return Ok((frame, cursor));
         }

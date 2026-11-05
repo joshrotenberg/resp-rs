@@ -82,6 +82,22 @@ unsafe fn parse_i64_unchecked(buf: &[u8]) -> i64 {
 /// `pos`, which guarantees a non-attribute frame eventually follows.
 #[inline(always)]
 unsafe fn parse_element(input: &Bytes, pos: usize) -> (Frame, usize) {
+    // Only a `|` tag starts an attribute; check it before parsing, as the safe
+    // parser does, so the common path is a direct call.
+    if *input.as_ref().get_unchecked(pos) == b'|' {
+        return parse_element_after_attributes(input, pos);
+    }
+    parse_inner(input, pos)
+}
+
+/// The rare path of [`parse_element`]: skip one or more leading attributes.
+///
+/// # Safety
+///
+/// Same contract as [`parse_element`].
+#[cold]
+#[inline(never)]
+unsafe fn parse_element_after_attributes(input: &Bytes, pos: usize) -> (Frame, usize) {
     let mut cursor = pos;
     loop {
         let (frame, next) = parse_inner(input, cursor);

@@ -160,6 +160,35 @@ fn bench_resp3_parse(c: &mut Criterion) {
         b.iter(|| resp_rs::resp3::parse_frame(data.clone()).unwrap());
     });
 
+    // 10-member set of bulk strings
+    let mut wire = "~10\r\n".to_string();
+    for i in 0..10 {
+        let s = format!("member-{i}");
+        wire.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+    }
+    group.bench_function("set_10", |b| {
+        let data = Bytes::from(wire.clone());
+        b.iter(|| resp_rs::resp3::parse_frame(data.clone()).unwrap());
+    });
+
+    // 100-pair map of bulk strings, the shape of an HGETALL reply
+    let mut wire = "%100\r\n".to_string();
+    for i in 0..100 {
+        let k = format!("field:{i:04}");
+        let v = format!("value-{i:04}-xxxxxxxxxxxxxxxx");
+        wire.push_str(&format!(
+            "${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            v.len(),
+            v
+        ));
+    }
+    group.bench_function("map_100", |b| {
+        let data = Bytes::from(wire.clone());
+        b.iter(|| resp_rs::resp3::parse_frame(data.clone()).unwrap());
+    });
+
     group.finish();
 }
 
