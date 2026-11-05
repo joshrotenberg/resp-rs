@@ -183,7 +183,9 @@ fuzz_target!(|data: &[u8]| {
         // We accept, they want more. Would mean we framed a shorter prefix than
         // the reference thinks is complete.
         (Ok((our_frame, _)), Ok(None)) => {
-            panic!("we accept a frame the reference considers incomplete\n  input: {data:?}\n  ours:  {our_frame:?}");
+            panic!(
+                "we accept a frame the reference considers incomplete\n  input: {data:?}\n  ours:  {our_frame:?}"
+            );
         }
     }
 });
