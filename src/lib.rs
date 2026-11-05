@@ -479,12 +479,14 @@ pub enum ParseError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SerializeError {
-    /// A line-based payload contains a CRLF, which would terminate the frame
-    /// early and let the remainder be read as further frames.
+    /// A simple string or error payload contains a CR or LF.
     ///
-    /// A bare `\r` is fine: the parser scans for the pair, so a lone `\r`
-    /// round-trips as payload.
-    #[error("line payload contains CRLF, which would split the frame")]
+    /// A CRLF pair would terminate the frame early and let the remainder be
+    /// read as further frames. A bare `\r` or `\n` is also refused: the RESP2
+    /// and RESP3 specs forbid both in these lines and hiredis rejects them,
+    /// although this crate's parser still reads them back. To send text that
+    /// may contain them, replace them first, as Redis maps each to a space.
+    #[error("line payload contains CR or LF")]
     LineContainsCrlf,
 
     /// A big number is not an optional sign followed by one or more digits.

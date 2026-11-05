@@ -1381,3 +1381,79 @@ fn chunks_and_headers_without_a_body_pass_through_streamed_aggregates() {
     let bytes = resp3::try_frame_to_bytes(&frame).unwrap();
     assert_eq!(resp3::parse_streaming_sequence(bytes).unwrap().0, frame);
 }
+
+#[test]
+fn checked_serializer_refuses_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid CR and LF in simple strings and errors, and
+    // hiredis rejects them, so a reply echoing user input must not carry one.
+    for payload in [&b"a\rb"[..], b"a\nb", b"a\r", b"\nb", b"\r", b"\n"] {
+        let line = || Frame::SimpleString(Bytes::copy_from_slice(payload));
+        for frame in [
+            line(),
+            Frame::Error(Bytes::copy_from_slice(payload)),
+            Frame::Map(vec![(int(1), line())]),
+            Frame::StreamedArray(vec![line()]),
+        ] {
+            assert_eq!(
+                resp3::try_frame_to_bytes(&frame),
+                Err(resp_rs::SerializeError::LineContainsCrlf),
+                "{frame:?}"
+            );
+        }
+    }
+    // Length-prefixed payloads carry any bytes.
+    let blob = Frame::BlobError(Bytes::from_static(b"ERR a\r\nb"));
+    assert!(resp3::try_frame_to_bytes(&blob).is_ok());
+    let verbatim = Frame::VerbatimString {
+        payload: Bytes::from_static(b"txt:a\nb"),
+    };
+    assert!(resp3::try_frame_to_bytes(&verbatim).is_ok());
+}
+
+#[test]
+fn bare_cr_or_lf_in_every_line_position_is_refused() {
+    // #99, every position a simple string or error can occupy.
+    let bad = || Frame::Error(Bytes::from_static(b"ERR a\nb"));
+    let frames = [
+        Frame::Array(Some(vec![bad()])),
+        Frame::Set(vec![bad()]),
+        Frame::Push(vec![bad()]),
+        Frame::Map(vec![(bad(), int(1))]),
+        Frame::Attribute(vec![(simple("k"), bad())]),
+        Frame::StreamedSet(vec![bad()]),
+        Frame::StreamedPush(vec![bad()]),
+        Frame::StreamedMap(vec![(bad(), int(1))]),
+        Frame::StreamedMap(vec![(int(1), bad())]),
+        Frame::StreamedAttribute(vec![(bad(), int(1))]),
+        Frame::Array(Some(vec![Frame::Set(vec![Frame::Map(vec![(
+            int(1),
+            bad(),
+        )])])])),
+    ];
+    for frame in frames {
+        assert_eq!(
+            resp3::try_frame_to_bytes(&frame),
+            Err(resp_rs::SerializeError::LineContainsCrlf),
+            "{frame:?}"
+        );
+    }
+}
+
+#[test]
+fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
+    // The checked serializer is stricter than the parser here until the parser
+    // side of #99 lands in 0.4. If this starts failing, the exception in the
+    // try_frame_to_bytes docs and the iff property tests can go.
+    for (wire, frame) in [
+        (&b"+a\rb\r\n"[..], simple("a\rb")),
+        (b"+a\nb\r\n", simple("a\nb")),
+        (
+            b"-ERR a\nb\r\n",
+            Frame::Error(Bytes::from_static(b"ERR a\nb")),
+        ),
+    ] {
+        let (parsed, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire)).unwrap();
+        assert_eq!(parsed, frame);
+        assert!(rest.is_empty());
+    }
+}

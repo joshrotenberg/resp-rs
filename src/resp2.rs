@@ -17,7 +17,9 @@
 //! # Protocol permissiveness
 //!
 //! Simple strings and errors are treated as raw bytes, not validated UTF-8.
-//! The parser accepts any byte sequence that does not contain `\r` or `\n`.
+//! The parser ends the line at the first CRLF pair, so a bare `\r` or `\n` is
+//! read back as payload. The specs forbid both there, and
+//! [`try_frame_to_bytes`] refuses to emit them (#99).
 //! This is intentional for zero-copy operation and compatibility with
 //! servers that may send non-UTF-8 data in these fields.
 
@@ -352,6 +354,10 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
 /// ```
 ///
+/// One deliberate exception: a bare `\r` or `\n` in a simple string or error
+/// payload is refused although this crate's parser reads it back, because the
+/// specs forbid it there and peers such as hiredis reject it (#99).
+///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 ///
@@ -371,9 +377,13 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// let ok = Frame::SimpleString(Bytes::from("OK"));
 /// assert_eq!(resp2::try_frame_to_bytes(&ok).unwrap(), Bytes::from("+OK\r\n"));
 ///
-/// // A bare CR is payload and round-trips.
+/// // A bare CR or LF is forbidden in these lines, and peers such as hiredis
+/// // reject it.
 /// let cr = Frame::SimpleString(Bytes::from(&b"a\rb"[..]));
-/// assert!(resp2::try_frame_to_bytes(&cr).is_ok());
+/// assert_eq!(
+///     resp2::try_frame_to_bytes(&cr),
+///     Err(SerializeError::LineContainsCrlf)
+/// );
 ///
 /// // A CRLF would split the frame.
 /// let split = Frame::SimpleString(Bytes::from(&b"a\r\nb"[..]));
@@ -388,13 +398,15 @@ pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
     Ok(buf.freeze())
 }
 
-/// Reject a line payload that would terminate its own frame.
+/// Reject a line payload containing a CR or LF.
 ///
-/// A bare `\r` is fine: [`find_crlf`] scans for the pair, so a lone `\r` is
-/// ordinary payload and round-trips.
+/// A CRLF pair would terminate the frame early. A bare `\r` or `\n` reads
+/// back through [`find_crlf`], which scans for the pair, but the specs forbid
+/// both in these lines and hiredis rejects them, so emitting one breaks other
+/// peers (#99).
 #[inline]
 fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
-    if payload.windows(2).any(|w| w == b"\r\n") {
+    if payload.iter().any(|&b| b == b'\r' || b == b'\n') {
         return Err(SerializeError::LineContainsCrlf);
     }
     Ok(())
