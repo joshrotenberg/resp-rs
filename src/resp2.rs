@@ -17,7 +17,9 @@
 //! # Protocol permissiveness
 //!
 //! Simple strings and errors are treated as raw bytes, not validated UTF-8.
-//! The parser accepts any byte sequence that does not contain `\r` or `\n`.
+//! The parser ends the line at the first CRLF pair, so a bare `\r` or `\n` is
+//! read back as payload. The specs forbid both there, and
+//! [`try_frame_to_bytes`] refuses to emit them (#99).
 //! This is intentional for zero-copy operation and compatibility with
 //! servers that may send non-UTF-8 data in these fields.
 

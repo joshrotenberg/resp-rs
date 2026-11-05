@@ -8,11 +8,13 @@ use proptest::prelude::*;
 /// Generate a byte string that is safe for RESP simple strings / errors.
 ///
 /// Only `\n` is excluded. A payload with no `\n` cannot contain `\r\n`, so it
-/// cannot terminate its own line, which is the actual constraint. A bare `\r`
-/// is ordinary payload data and is deliberately included: excluding it also
+/// cannot terminate its own line, which is the parser's constraint. A bare `\r`
+/// is payload to the parser and is deliberately included: excluding it also
 /// excluded the only byte on which the safe and unchecked parsers disagreed
 /// (issue #65), so the equivalence properties were asserting equivalence over
-/// an alphabet chosen to omit the counterexample.
+/// an alphabet chosen to omit the counterexample. The checked serializer
+/// refuses a bare `\r` (#99); the iff properties account for that with
+/// `resp3_scrub` and `resp2_scrub`.
 fn safe_line_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(
         prop::num::u8::ANY.prop_filter("no LF", |b| *b != b'\n'),
@@ -143,41 +145,110 @@ fn is_assembled_streaming(frame: &resp_rs::resp3::Frame) -> bool {
     )
 }
 
-fn has_cr_or_lf(b: &[u8]) -> bool {
-    b.iter().any(|&c| c == b'\r' || c == b'\n')
-}
-
-/// True if a simple string or error anywhere in the frame contains a CR or LF.
-/// These round-trip through this crate's parser but `try_frame_to_bytes`
-/// refuses them, because the specs forbid them and hiredis rejects them (#99).
-fn resp3_has_line_cr_or_lf(frame: &resp_rs::resp3::Frame) -> bool {
-    use resp_rs::resp3::Frame;
-    match frame {
-        Frame::SimpleString(b) | Frame::Error(b) => has_cr_or_lf(b),
-        Frame::Array(Some(items))
-        | Frame::Set(items)
-        | Frame::Push(items)
-        | Frame::StreamedArray(items)
-        | Frame::StreamedSet(items)
-        | Frame::StreamedPush(items) => items.iter().any(resp3_has_line_cr_or_lf),
-        Frame::Map(pairs)
-        | Frame::Attribute(pairs)
-        | Frame::StreamedMap(pairs)
-        | Frame::StreamedAttribute(pairs) => pairs
-            .iter()
-            .any(|(k, v)| resp3_has_line_cr_or_lf(k) || resp3_has_line_cr_or_lf(v)),
-        _ => false,
+/// Replace each `\r` and `\n` in a line payload with a space, as Redis does,
+/// and report whether any were found.
+fn scrub_line(b: &Bytes, found: &mut bool) -> Bytes {
+    if b.iter().any(|&c| c == b'\r' || c == b'\n') {
+        *found = true;
+        b.iter()
+            .map(|&c| if c == b'\r' || c == b'\n' { b' ' } else { c })
+            .collect::<Vec<u8>>()
+            .into()
+    } else {
+        b.clone()
     }
 }
 
-/// RESP2 counterpart of [`resp3_has_line_cr_or_lf`].
-fn resp2_has_line_cr_or_lf(frame: &resp_rs::resp2::Frame) -> bool {
+/// Scrub every simple string and error in the frame with [`scrub_line`].
+///
+/// A bare CR or LF in those payloads round-trips through this crate's parser
+/// but `try_frame_to_bytes` refuses it, because the specs forbid it and hiredis
+/// rejects it (#99). The iff properties assert that refusal, then check the
+/// scrubbed frame, so the exception does not hide any other rule in the same
+/// frame. The match is exhaustive so a new variant has to be placed here.
+fn resp3_scrub(frame: &resp_rs::resp3::Frame, found: &mut bool) -> resp_rs::resp3::Frame {
+    use resp_rs::resp3::Frame;
+    let items = |v: &Vec<Frame>, found: &mut bool| -> Vec<Frame> {
+        v.iter().map(|f| resp3_scrub(f, found)).collect()
+    };
+    let pairs = |v: &Vec<(Frame, Frame)>, found: &mut bool| -> Vec<(Frame, Frame)> {
+        v.iter()
+            .map(|(k, val)| (resp3_scrub(k, found), resp3_scrub(val, found)))
+            .collect()
+    };
+    match frame {
+        Frame::SimpleString(b) => Frame::SimpleString(scrub_line(b, found)),
+        Frame::Error(b) => Frame::Error(scrub_line(b, found)),
+        Frame::Array(Some(v)) => Frame::Array(Some(items(v, found))),
+        Frame::Set(v) => Frame::Set(items(v, found)),
+        Frame::Push(v) => Frame::Push(items(v, found)),
+        Frame::StreamedArray(v) => Frame::StreamedArray(items(v, found)),
+        Frame::StreamedSet(v) => Frame::StreamedSet(items(v, found)),
+        Frame::StreamedPush(v) => Frame::StreamedPush(items(v, found)),
+        Frame::Map(v) => Frame::Map(pairs(v, found)),
+        Frame::Attribute(v) => Frame::Attribute(pairs(v, found)),
+        Frame::StreamedMap(v) => Frame::StreamedMap(pairs(v, found)),
+        Frame::StreamedAttribute(v) => Frame::StreamedAttribute(pairs(v, found)),
+        // No line payload: typed values, length-prefixed bodies and fixed tokens.
+        Frame::Array(None)
+        | Frame::Integer(_)
+        | Frame::BulkString(_)
+        | Frame::BlobError(_)
+        | Frame::StreamedStringHeader
+        | Frame::StreamedBlobErrorHeader
+        | Frame::StreamedVerbatimStringHeader
+        | Frame::StreamedArrayHeader
+        | Frame::StreamedSetHeader
+        | Frame::StreamedMapHeader
+        | Frame::StreamedAttributeHeader
+        | Frame::StreamedPushHeader
+        | Frame::StreamedStringChunk(_)
+        | Frame::StreamedString(_)
+        | Frame::StreamTerminator
+        | Frame::Null
+        | Frame::Double(_)
+        | Frame::SpecialFloat(_)
+        | Frame::Boolean(_)
+        | Frame::BigNumber(_)
+        | Frame::VerbatimString { .. } => frame.clone(),
+    }
+}
+
+/// RESP2 counterpart of [`resp3_scrub`].
+fn resp2_scrub(frame: &resp_rs::resp2::Frame, found: &mut bool) -> resp_rs::resp2::Frame {
     use resp_rs::resp2::Frame;
     match frame {
-        Frame::SimpleString(b) | Frame::Error(b) => has_cr_or_lf(b),
-        Frame::Array(Some(items)) => items.iter().any(resp2_has_line_cr_or_lf),
-        _ => false,
+        Frame::SimpleString(b) => Frame::SimpleString(scrub_line(b, found)),
+        Frame::Error(b) => Frame::Error(scrub_line(b, found)),
+        Frame::Array(Some(v)) => {
+            Frame::Array(Some(v.iter().map(|f| resp2_scrub(f, found)).collect()))
+        }
+        Frame::Array(None) | Frame::Integer(_) | Frame::BulkString(_) => frame.clone(),
     }
+}
+
+/// Whether the frame round-trips through the reader it actually has.
+///
+/// Assembled streaming frames are read back by parse_streaming_sequence, never
+/// by parse_frame, which sees only their bare header and leaves the body
+/// behind. Using parse_frame for them would assert that they can never be
+/// serialized, which is not what the crate claims: the top level is exactly
+/// where they are legitimate.
+fn resp3_round_trips(frame: &resp_rs::resp3::Frame) -> bool {
+    let bytes = resp_rs::resp3::frame_to_bytes(frame);
+    let parsed = if is_assembled_streaming(frame) {
+        resp_rs::resp3::parse_streaming_sequence(bytes)
+    } else {
+        resp_rs::resp3::parse_frame(bytes)
+    };
+    matches!(parsed, Ok((p, rest)) if &p == frame && rest.is_empty())
+}
+
+fn resp2_round_trips(frame: &resp_rs::resp2::Frame) -> bool {
+    matches!(
+        resp_rs::resp2::parse_frame(resp_rs::resp2::frame_to_bytes(frame)),
+        Ok((p, rest)) if &p == frame && rest.is_empty()
+    )
 }
 
 /// Frames including shapes that deliberately may NOT round-trip.
@@ -226,6 +297,8 @@ fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // CRLF inside a line payload, which the checked path catches at top
         // level but skipped inside streamed aggregates (#85).
         1 => Just(Frame::SimpleString(Bytes::from_static(b"sp\r\nlit"))),
+        // A bare LF, which safe_line_bytes never produces (#99).
+        1 => Just(Frame::Error(Bytes::from_static(b"ERR a\nb"))),
     ];
 
     prop_oneof![
@@ -823,49 +896,48 @@ proptest! {
     /// immediately, which is how #67 opened the BigNumber gap unnoticed.
     #[test]
     fn resp3_checked_serialization_iff_roundtrip(frame in arb_resp3_frame_any()) {
-        // Assembled streaming frames are read back by parse_streaming_sequence,
-        // never by parse_frame, which sees only their bare header and leaves the
-        // body behind. Using parse_frame for them would assert that they can
-        // never be serialized, which is not what the crate claims: the top level
-        // is exactly where they are legitimate. The entry point is chosen by
-        // shape so the property tests the reader the frame actually has.
-        let bytes = resp_rs::resp3::frame_to_bytes(&frame);
-        let round_trips = if is_assembled_streaming(&frame) {
-            match resp_rs::resp3::parse_streaming_sequence(bytes) {
-                Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
-                Err(_) => false,
-            }
-        } else {
-            match resp_rs::resp3::parse_frame(bytes) {
-                Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
-                Err(_) => false,
-            }
-        };
-        // The one deliberate exception to the iff: see resp3_has_line_cr_or_lf.
-        let expected = round_trips && !resp3_has_line_cr_or_lf(&frame);
+        // The one deliberate exception (#99): a bare CR or LF in a line payload
+        // is refused even where it round-trips. Assert that, then hold the
+        // scrubbed frame to the iff so every other rule is still checked.
+        let mut found = false;
+        let scrubbed = resp3_scrub(&frame, &mut found);
+        if found {
+            prop_assert!(
+                resp_rs::resp3::try_frame_to_bytes(&frame).is_err(),
+                "CR or LF in a line payload was accepted: {:?}",
+                frame
+            );
+        }
         prop_assert_eq!(
-            resp_rs::resp3::try_frame_to_bytes(&frame).is_ok(),
-            expected,
+            resp_rs::resp3::try_frame_to_bytes(&scrubbed).is_ok(),
+            resp3_round_trips(&scrubbed),
             "checked serialization disagreed with round trip for {:?}",
-            frame
+            scrubbed
         );
     }
 
     #[test]
-    fn resp2_checked_serialization_iff_roundtrip(frame in arb_resp2_frame()) {
-        let round_trips = match resp_rs::resp2::parse_frame(
-            resp_rs::resp2::frame_to_bytes(&frame),
-        ) {
-            Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
-            Err(_) => false,
-        };
-        // The one deliberate exception to the iff: see resp2_has_line_cr_or_lf.
-        let expected = round_trips && !resp2_has_line_cr_or_lf(&frame);
+    fn resp2_checked_serialization_iff_roundtrip(
+        frame in prop_oneof![
+            9 => arb_resp2_frame(),
+            // safe_line_bytes never produces a bare LF.
+            1 => Just(resp_rs::resp2::Frame::Error(Bytes::from_static(b"ERR a\nb"))),
+        ]
+    ) {
+        let mut found = false;
+        let scrubbed = resp2_scrub(&frame, &mut found);
+        if found {
+            prop_assert!(
+                resp_rs::resp2::try_frame_to_bytes(&frame).is_err(),
+                "CR or LF in a line payload was accepted: {:?}",
+                frame
+            );
+        }
         prop_assert_eq!(
-            resp_rs::resp2::try_frame_to_bytes(&frame).is_ok(),
-            expected,
+            resp_rs::resp2::try_frame_to_bytes(&scrubbed).is_ok(),
+            resp2_round_trips(&scrubbed),
             "checked serialization disagreed with round trip for {:?}",
-            frame
+            scrubbed
         );
     }
 

@@ -13,7 +13,9 @@
 //! # Protocol permissiveness
 //!
 //! - **Simple strings and errors** are treated as raw bytes, not validated UTF-8.
-//!   The parser accepts any byte sequence that does not contain `\r` or `\n`.
+//!   The parser ends the line at the first CRLF pair, so a bare `\r` or `\n`
+//!   is read back as payload. The specs forbid both there, and
+//!   [`try_frame_to_bytes`] refuses to emit them (#99).
 //! - **Double parsing** accepts case-insensitive and non-canonical float spellings
 //!   (e.g., `INF`, `Infinity`, `NAN`) via Rust's `f64::parse`, then normalizes
 //!   them to canonical [`Frame::SpecialFloat`] values (`inf`, `-inf`, `nan`).
@@ -1340,10 +1342,11 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 ///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
-/// What that catches, beyond the CRLF case:
+/// What that catches, beyond a CRLF in a line payload:
 ///
 /// | Frame | Unchecked wire | Comes back as |
 /// | --- | --- | --- |
+/// | `SimpleString(b"a\nb")` | `+a\nb\r\n` | parses here, rejected by hiredis |
 /// | `BigNumber(b"abc")` | `(abc\r\n` | rejected |
 /// | `SpecialFloat(b"1.5")` | `,1.5\r\n` | `Double(1.5)` |
 /// | `Double(f64::NAN)` | `,NaN\r\n` | `SpecialFloat(b"nan")` |

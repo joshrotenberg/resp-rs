@@ -255,6 +255,30 @@ mod tests {
     }
 
     #[test]
+    fn encode_refuses_a_bare_cr_or_lf_in_a_line_payload() {
+        // #99. These parse back here but the specs forbid them and hiredis
+        // rejects them, so a reply echoing user input must not carry one.
+        for reply in [
+            Frame::Error(Bytes::from_static(b"ERR unknown command 'a\nb'")),
+            Frame::SimpleString(Bytes::from_static(b"a\rb")),
+        ] {
+            let mut codec = Codec::new();
+            let mut buf = BytesMut::new();
+            let result = codec.encode(reply, &mut buf);
+            assert!(
+                matches!(
+                    result,
+                    Err(CodecError::Serialize(
+                        crate::SerializeError::LineContainsCrlf
+                    ))
+                ),
+                "got {result:?}"
+            );
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
     fn encode_simple() {
         let mut codec = Codec::new();
         let mut buf = BytesMut::new();

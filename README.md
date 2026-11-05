@@ -220,6 +220,22 @@ cargo bench
 
 ## Upgrading
 
+### 0.3.1 to 0.3.2
+
+`try_frame_to_bytes` in both protocols, and so the `Codec` encoders, now refuse
+a bare `\r` or `\n` in a simple string or error payload, returning
+`SerializeError::LineContainsCrlf` as for a CRLF pair. The specs forbid both
+there and hiredis rejects them. A server that reflects user input into an error
+reply should replace them first; Redis maps each to a space. The parser still
+accepts them on input.
+
+`resp3::parse_streaming_sequence` assembles a streamed value nested directly in
+a streamed aggregate, where it used to return the header and misreport the
+consumed length, and skips attributes in element position, as `parse_frame`
+does for counted aggregates. `try_frame_to_bytes` follows the same rules inside
+a streamed aggregate and has one new error variant,
+`StreamHeaderInStreamedAggregate`.
+
 ### 0.2 to 0.3
 
 **`resp3::Frame::VerbatimString` is now a struct variant holding one payload.**

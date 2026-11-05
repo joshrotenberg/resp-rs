@@ -578,3 +578,24 @@ fn checked_serializer_refuses_a_bare_cr_or_lf_in_line_payloads() {
     let raw = resp2::frame_to_bytes(&Frame::Error(Bytes::from_static(b"ERR a\nb")));
     assert_eq!(raw, Bytes::from_static(b"-ERR a\nb\r\n"));
 }
+
+#[test]
+fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
+    // The checked serializer is stricter than the parser here until the parser
+    // side of #99 lands in 0.4. If this starts failing, the exception in the
+    // try_frame_to_bytes docs and the iff property test can go.
+    for (wire, frame) in [
+        (
+            &b"+a\rb\r\n"[..],
+            Frame::SimpleString(Bytes::from_static(b"a\rb")),
+        ),
+        (
+            b"-ERR a\nb\r\n",
+            Frame::Error(Bytes::from_static(b"ERR a\nb")),
+        ),
+    ] {
+        let (parsed, rest) = resp2::parse_frame(Bytes::copy_from_slice(wire)).unwrap();
+        assert_eq!(parsed, frame);
+        assert!(rest.is_empty());
+    }
+}
