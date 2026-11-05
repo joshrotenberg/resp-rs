@@ -1109,3 +1109,218 @@ fn streamed_aggregate_contents_are_validated() {
     }]);
     assert!(resp3::try_frame_to_bytes(&bad_verbatim).is_err());
 }
+
+fn seq(wire: &'static str) -> (Frame, Bytes) {
+    resp3::parse_streaming_sequence(Bytes::from_static(wire.as_bytes())).unwrap()
+}
+
+fn int(n: i64) -> Frame {
+    Frame::Integer(n)
+}
+
+fn simple(s: &'static str) -> Frame {
+    Frame::SimpleString(Bytes::from_static(s.as_bytes()))
+}
+
+#[test]
+fn nested_streamed_array_is_assembled() {
+    // #97. Each element was read with parse_frame, so the inner header became
+    // an element and the inner terminator closed the outer array, leaving
+    // `.\r\n` behind to be read as the next frame.
+    let (frame, rest) = seq("*?\r\n*?\r\n:1\r\n.\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedArray(vec![Frame::StreamedArray(vec![int(1)])])
+    );
+    assert!(rest.is_empty());
+
+    // Elements after the nested container stay in the outer one.
+    let (frame, rest) = seq("*?\r\n:0\r\n*?\r\n:1\r\n.\r\n:2\r\n.\r\n+next\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedArray(vec![int(0), Frame::StreamedArray(vec![int(1)]), int(2)])
+    );
+    assert_eq!(rest, Bytes::from_static(b"+next\r\n"));
+}
+
+#[test]
+fn nested_streamed_string_is_assembled() {
+    // #97. The `$?` header and each `;` chunk used to be separate elements.
+    let (frame, rest) = seq("*?\r\n$?\r\n;3\r\nabc\r\n;0\r\n:1\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedArray(vec![
+            Frame::StreamedString(vec![Bytes::from_static(b"abc")]),
+            int(1),
+        ])
+    );
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn nested_streamed_values_in_maps_and_sets() {
+    let (frame, rest) = seq("%?\r\n+k\r\n~?\r\n:1\r\n.\r\n>?\r\n:2\r\n.\r\n+v\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedMap(vec![
+            (simple("k"), Frame::StreamedSet(vec![int(1)])),
+            (Frame::StreamedPush(vec![int(2)]), simple("v")),
+        ])
+    );
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn nested_streamed_sequence_missing_inner_terminator_is_incomplete() {
+    // Without the fix this was a complete frame with the wrong length.
+    let result = resp3::parse_streaming_sequence(Bytes::from_static(b"*?\r\n*?\r\n:1\r\n.\r\n"));
+    assert_eq!(result, Err(ParseError::Incomplete));
+}
+
+#[test]
+fn streamed_header_inside_counted_aggregate_is_unchanged() {
+    // Out of scope for #97: parse_frame returns a streamed header inside a
+    // counted aggregate as the bare header, and parse_streaming_sequence reads
+    // counted aggregates with parse_frame's rules.
+    let (frame, rest) = seq("*?\r\n*1\r\n*?\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedArray(vec![Frame::Array(Some(vec![Frame::StreamedArrayHeader]))])
+    );
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn attribute_in_streamed_array_is_skipped() {
+    // #98. #59 fixed this for counted aggregates; the streamed path returned
+    // the attribute as an element.
+    let (frame, rest) = seq("*?\r\n|1\r\n+a\r\n:1\r\n:2\r\n.\r\n");
+    assert_eq!(frame, Frame::StreamedArray(vec![int(2)]));
+    assert!(rest.is_empty());
+
+    // Same tree as the counted form.
+    let (counted, _) =
+        resp3::parse_frame(Bytes::from_static(b"*1\r\n|1\r\n+a\r\n:1\r\n:2\r\n")).unwrap();
+    assert_eq!(counted, Frame::Array(Some(vec![int(2)])));
+}
+
+#[test]
+fn attribute_before_streamed_terminator_is_discarded() {
+    // #98. There is no element for it to describe.
+    let (frame, rest) = seq("*?\r\n:1\r\n|1\r\n+a\r\n:1\r\n.\r\n");
+    assert_eq!(frame, Frame::StreamedArray(vec![int(1)]));
+    assert!(rest.is_empty());
+
+    let (frame, _) = seq("~?\r\n|1\r\n+a\r\n:1\r\n.\r\n");
+    assert_eq!(frame, Frame::StreamedSet(vec![]));
+}
+
+#[test]
+fn attribute_in_streamed_map_does_not_shift_pairs() {
+    // #98. An attribute in a key or value slot used to shift every following
+    // key and value by one.
+    let (frame, rest) =
+        seq("%?\r\n|1\r\n+a\r\n:1\r\n+k1\r\n|1\r\n+b\r\n:2\r\n+v1\r\n+k2\r\n+v2\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedMap(vec![
+            (simple("k1"), simple("v1")),
+            (simple("k2"), simple("v2")),
+        ])
+    );
+    assert!(rest.is_empty());
+
+    // An attribute in a value slot followed by the terminator leaves the key
+    // without a value, as a bare terminator there already did.
+    let result =
+        resp3::parse_streaming_sequence(Bytes::from_static(b"%?\r\n+k\r\n|1\r\n+a\r\n:1\r\n.\r\n"));
+    assert_eq!(result, Err(ParseError::InvalidFormat));
+}
+
+#[test]
+fn streamed_attribute_in_streamed_aggregate_is_skipped() {
+    // A streamed attribute is metadata like a counted one.
+    let (frame, rest) = seq("*?\r\n|?\r\n+a\r\n:1\r\n.\r\n:2\r\n.\r\n");
+    assert_eq!(frame, Frame::StreamedArray(vec![int(2)]));
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn top_level_attribute_is_still_returned() {
+    // Only the element position skips attributes.
+    let (frame, _) = seq("|1\r\n+a\r\n:1\r\n");
+    assert_eq!(frame, Frame::Attribute(vec![(simple("a"), int(1))]));
+    let (frame, _) = seq("|?\r\n+a\r\n:1\r\n.\r\n");
+    assert_eq!(frame, Frame::StreamedAttribute(vec![(simple("a"), int(1))]));
+}
+
+#[test]
+fn nested_streamed_aggregates_share_the_depth_budget() {
+    let depth = resp3::MAX_DEPTH as usize;
+    let at_limit = format!("{}{}", "*?\r\n".repeat(depth), ".\r\n".repeat(depth));
+    let (frame, rest) = resp3::parse_streaming_sequence(Bytes::from(at_limit)).unwrap();
+    assert!(matches!(frame, Frame::StreamedArray(_)));
+    assert!(rest.is_empty());
+
+    let over = format!(
+        "{}{}",
+        "*?\r\n".repeat(depth + 1),
+        ".\r\n".repeat(depth + 1)
+    );
+    assert_eq!(
+        resp3::parse_streaming_sequence(Bytes::from(over)),
+        Err(ParseError::DepthExceeded)
+    );
+
+    // A counted aggregate inside a streamed one spends from the same budget.
+    let mixed = format!("*?\r\n{}:1\r\n.\r\n", "*1\r\n".repeat(depth));
+    assert_eq!(
+        resp3::parse_streaming_sequence(Bytes::from(mixed)),
+        Err(ParseError::DepthExceeded)
+    );
+}
+
+#[test]
+fn checked_serializer_follows_the_streamed_element_rules() {
+    use resp_rs::SerializeError;
+
+    // Assembled streaming frames round-trip as elements of a streamed
+    // aggregate now that the parser assembles them there (#97).
+    let nested = Frame::StreamedMap(vec![(
+        Frame::StreamedString(vec![Bytes::from_static(b"abc")]),
+        Frame::StreamedArray(vec![Frame::StreamedSet(vec![int(1)])]),
+    )]);
+    let bytes = resp3::try_frame_to_bytes(&nested).unwrap();
+    let (parsed, rest) = resp3::parse_streaming_sequence(bytes).unwrap();
+    assert_eq!(parsed, nested);
+    assert!(rest.is_empty());
+
+    // A bare streamed header there would have the following elements read as
+    // its body.
+    let header = Frame::StreamedArray(vec![Frame::StreamedArrayHeader, int(1)]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&header),
+        Err(SerializeError::StreamHeaderInStreamedAggregate)
+    );
+
+    // Attributes are skipped by the parser there, so they cannot be elements
+    // (#98).
+    let attr = Frame::StreamedArray(vec![Frame::Attribute(vec![(simple("a"), int(1))])]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&attr),
+        Err(SerializeError::AttributeInAggregate)
+    );
+    let streamed_attr = Frame::StreamedSet(vec![Frame::StreamedAttribute(vec![])]);
+    assert_eq!(
+        resp3::try_frame_to_bytes(&streamed_attr),
+        Err(SerializeError::AttributeInAggregate)
+    );
+
+    // Inside a counted aggregate an assembled streaming frame is still refused
+    // (#83).
+    let counted = Frame::Array(Some(vec![Frame::StreamedArray(vec![int(1)])]));
+    assert_eq!(
+        resp3::try_frame_to_bytes(&counted),
+        Err(SerializeError::NestedStreamingFrame)
+    );
+}

@@ -128,8 +128,8 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
     ]
 }
 
-/// The six frames only `parse_streaming_sequence` produces, and only at the top
-/// level. Mirrors `resp3::is_assembled_streaming`.
+/// The six frames only `parse_streaming_sequence` produces, at the top level or
+/// inside another streamed aggregate. Mirrors `resp3::is_assembled_streaming`.
 fn is_assembled_streaming(frame: &resp_rs::resp3::Frame) -> bool {
     use resp_rs::resp3::Frame;
     matches!(
@@ -162,11 +162,17 @@ fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // inside a counted one (#84). The opposite rule to Attribute, which is
         // why one shared check produced an immediate counterexample.
         1 => Just(Frame::StreamTerminator),
-        // Only parse_streaming_sequence produces these, and only at the top
-        // level, so nesting one emits bytes that read back as a bare header
-        // with the body left over (#83).
+        // Only parse_streaming_sequence produces these. Inside a counted
+        // aggregate they read back as a bare header with the body left over
+        // (#83); inside a streamed one they are assembled and round-trip (#97).
         1 => Just(Frame::StreamedString(vec![Bytes::from_static(b"abc")])),
         1 => Just(Frame::StreamedArray(vec![Frame::Integer(1)])),
+        // A bare streamed header: an ordinary element of a counted aggregate,
+        // but inside a streamed one the parser reads its body (#97).
+        1 => Just(Frame::StreamedArrayHeader),
+        // Skipped by the parser inside a streamed aggregate, like a counted
+        // attribute (#98).
+        1 => Just(Frame::StreamedAttribute(vec![])),
         // The over-length case for #82 is deliberately NOT here. It found the
         // bug, but a 64 KB payload allocated on every generated case is a real
         // cost, and it shrinks to a 65 KB literal in the regressions file. The
@@ -478,6 +484,20 @@ fn arb_resp3_streaming_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         any::<bool>().prop_map(Frame::Boolean),
     ];
 
+    // Streamed values nested directly in a streamed aggregate are assembled by
+    // parse_streaming_sequence (#97), so they belong in the round-trip set.
+    let nested_streamed = prop_oneof![
+        prop::collection::vec(
+            prop::collection::vec(any::<u8>(), 1..16).prop_map(Bytes::from),
+            0..3,
+        )
+        .prop_map(Frame::StreamedString),
+        prop::collection::vec(inner_leaf.clone(), 0..3).prop_map(Frame::StreamedArray),
+        prop::collection::vec((inner_leaf.clone(), inner_leaf.clone()), 0..2)
+            .prop_map(Frame::StreamedMap),
+    ];
+    let element = prop_oneof![4 => inner_leaf.clone(), 1 => nested_streamed];
+
     prop_oneof![
         // StreamedString
         prop::collection::vec(
@@ -485,6 +505,9 @@ fn arb_resp3_streaming_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
             0..6,
         )
         .prop_map(Frame::StreamedString),
+        // Streamed aggregates holding streamed values
+        prop::collection::vec(element.clone(), 0..6).prop_map(Frame::StreamedArray),
+        prop::collection::vec((element.clone(), element), 0..4).prop_map(Frame::StreamedMap),
         // StreamedArray
         prop::collection::vec(inner_leaf.clone(), 0..6).prop_map(Frame::StreamedArray),
         // StreamedSet
