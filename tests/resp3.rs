@@ -1381,3 +1381,31 @@ fn chunks_and_headers_without_a_body_pass_through_streamed_aggregates() {
     let bytes = resp3::try_frame_to_bytes(&frame).unwrap();
     assert_eq!(resp3::parse_streaming_sequence(bytes).unwrap().0, frame);
 }
+
+#[test]
+fn checked_serializer_refuses_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid CR and LF in simple strings and errors, and
+    // hiredis rejects them, so a reply echoing user input must not carry one.
+    for payload in [&b"a\rb"[..], b"a\nb", b"a\r", b"\nb", b"\r", b"\n"] {
+        let line = || Frame::SimpleString(Bytes::copy_from_slice(payload));
+        for frame in [
+            line(),
+            Frame::Error(Bytes::copy_from_slice(payload)),
+            Frame::Map(vec![(int(1), line())]),
+            Frame::StreamedArray(vec![line()]),
+        ] {
+            assert_eq!(
+                resp3::try_frame_to_bytes(&frame),
+                Err(resp_rs::SerializeError::LineContainsCrlf),
+                "{frame:?}"
+            );
+        }
+    }
+    // Length-prefixed payloads carry any bytes.
+    let blob = Frame::BlobError(Bytes::from_static(b"ERR a\r\nb"));
+    assert!(resp3::try_frame_to_bytes(&blob).is_ok());
+    let verbatim = Frame::VerbatimString {
+        payload: Bytes::from_static(b"txt:a\nb"),
+    };
+    assert!(resp3::try_frame_to_bytes(&verbatim).is_ok());
+}

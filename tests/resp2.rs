@@ -551,3 +551,30 @@ fn an_over_long_line_is_rejected_even_when_terminated() {
         Err(ParseError::LineTooLong)
     );
 }
+
+#[test]
+fn checked_serializer_refuses_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid CR and LF in simple strings and errors, and
+    // hiredis rejects them, so a reply echoing user input must not carry one.
+    for payload in [&b"a\rb"[..], b"a\nb", b"a\r", b"\nb", b"\r", b"\n"] {
+        for frame in [
+            Frame::SimpleString(Bytes::copy_from_slice(payload)),
+            Frame::Error(Bytes::copy_from_slice(payload)),
+            Frame::Array(Some(vec![Frame::SimpleString(Bytes::copy_from_slice(
+                payload,
+            ))])),
+        ] {
+            assert_eq!(
+                resp2::try_frame_to_bytes(&frame),
+                Err(resp_rs::SerializeError::LineContainsCrlf),
+                "{frame:?}"
+            );
+        }
+    }
+    // Bulk strings carry any bytes.
+    let bulk = Frame::BulkString(Some(Bytes::from_static(b"a\r\nb\rc\nd")));
+    assert!(resp2::try_frame_to_bytes(&bulk).is_ok());
+    // The unchecked writer is unchanged.
+    let raw = resp2::frame_to_bytes(&Frame::Error(Bytes::from_static(b"ERR a\nb")));
+    assert_eq!(raw, Bytes::from_static(b"-ERR a\nb\r\n"));
+}

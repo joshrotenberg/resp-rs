@@ -1334,6 +1334,10 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// the rest), the reader is [`parse_streaming_sequence`] instead, since
 /// `parse_frame` returns only their header.
 ///
+/// One deliberate exception: a bare `\r` or `\n` in a simple string or error
+/// payload is refused although this crate's parser reads it back, because the
+/// specs forbid it there and peers such as hiredis reject it (#99).
+///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 /// What that catches, beyond the CRLF case:
@@ -1375,13 +1379,15 @@ pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
     Ok(buf.freeze())
 }
 
-/// Reject a line payload that would terminate its own frame.
+/// Reject a line payload containing a CR or LF.
 ///
-/// A bare `\r` is fine: [`find_crlf`] scans for the pair, so a lone `\r` is
-/// ordinary payload and round-trips.
+/// A CRLF pair would terminate the frame early. A bare `\r` or `\n` reads
+/// back through [`find_crlf`], which scans for the pair, but the specs forbid
+/// both in these lines and hiredis rejects them, so emitting one breaks other
+/// peers (#99).
 #[inline]
 fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
-    if payload.windows(2).any(|w| w == b"\r\n") {
+    if payload.iter().any(|&b| b == b'\r' || b == b'\n') {
         return Err(SerializeError::LineContainsCrlf);
     }
     // Same constant the parser scans against, so the two cannot drift. #63 and

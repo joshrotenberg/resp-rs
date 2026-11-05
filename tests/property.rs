@@ -143,6 +143,43 @@ fn is_assembled_streaming(frame: &resp_rs::resp3::Frame) -> bool {
     )
 }
 
+fn has_cr_or_lf(b: &[u8]) -> bool {
+    b.iter().any(|&c| c == b'\r' || c == b'\n')
+}
+
+/// True if a simple string or error anywhere in the frame contains a CR or LF.
+/// These round-trip through this crate's parser but `try_frame_to_bytes`
+/// refuses them, because the specs forbid them and hiredis rejects them (#99).
+fn resp3_has_line_cr_or_lf(frame: &resp_rs::resp3::Frame) -> bool {
+    use resp_rs::resp3::Frame;
+    match frame {
+        Frame::SimpleString(b) | Frame::Error(b) => has_cr_or_lf(b),
+        Frame::Array(Some(items))
+        | Frame::Set(items)
+        | Frame::Push(items)
+        | Frame::StreamedArray(items)
+        | Frame::StreamedSet(items)
+        | Frame::StreamedPush(items) => items.iter().any(resp3_has_line_cr_or_lf),
+        Frame::Map(pairs)
+        | Frame::Attribute(pairs)
+        | Frame::StreamedMap(pairs)
+        | Frame::StreamedAttribute(pairs) => pairs
+            .iter()
+            .any(|(k, v)| resp3_has_line_cr_or_lf(k) || resp3_has_line_cr_or_lf(v)),
+        _ => false,
+    }
+}
+
+/// RESP2 counterpart of [`resp3_has_line_cr_or_lf`].
+fn resp2_has_line_cr_or_lf(frame: &resp_rs::resp2::Frame) -> bool {
+    use resp_rs::resp2::Frame;
+    match frame {
+        Frame::SimpleString(b) | Frame::Error(b) => has_cr_or_lf(b),
+        Frame::Array(Some(items)) => items.iter().any(resp2_has_line_cr_or_lf),
+        _ => false,
+    }
+}
+
 /// Frames including shapes that deliberately may NOT round-trip.
 ///
 /// `arb_resp3_frame` is the round-trippable set, and several tests depend on
@@ -804,9 +841,11 @@ proptest! {
                 Err(_) => false,
             }
         };
+        // The one deliberate exception to the iff: see resp3_has_line_cr_or_lf.
+        let expected = round_trips && !resp3_has_line_cr_or_lf(&frame);
         prop_assert_eq!(
             resp_rs::resp3::try_frame_to_bytes(&frame).is_ok(),
-            round_trips,
+            expected,
             "checked serialization disagreed with round trip for {:?}",
             frame
         );
@@ -820,9 +859,11 @@ proptest! {
             Ok((parsed, rest)) => parsed == frame && rest.is_empty(),
             Err(_) => false,
         };
+        // The one deliberate exception to the iff: see resp2_has_line_cr_or_lf.
+        let expected = round_trips && !resp2_has_line_cr_or_lf(&frame);
         prop_assert_eq!(
             resp_rs::resp2::try_frame_to_bytes(&frame).is_ok(),
-            round_trips,
+            expected,
             "checked serialization disagreed with round trip for {:?}",
             frame
         );
