@@ -766,18 +766,19 @@ fn check_bare_crlf(buf: &[u8], pos: usize) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Check a big number payload against the grammar: an optional sign followed by
+/// Check a big number payload against the grammar: an optional `-` followed by
 /// one or more decimal digits.
+///
+/// A `+` sign was accepted until #104; hiredis rejects it, and it is consistent
+/// with integers (#102). Leading zeros and `-0` are still accepted: the payload
+/// is passed through as bytes rather than interpreted, and hiredis accepts them.
 ///
 /// Without this the arm hands back whatever the line held, and `frame_to_bytes`
 /// re-emits it verbatim, so the crate would both accept and reproduce
 /// non-conforming wire bytes.
 #[inline]
 fn check_big_number(payload: &[u8]) -> Result<(), ParseError> {
-    let digits = match payload.first() {
-        Some(b'+') | Some(b'-') => &payload[1..],
-        _ => payload,
-    };
+    let digits = payload.strip_prefix(b"-").unwrap_or(payload);
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(ParseError::InvalidFormat);
     }
@@ -1520,10 +1521,7 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
         }
         Frame::BigNumber(n) => {
             // parse_frame_inner checks the same grammar via check_big_number.
-            let digits = match n.first() {
-                Some(b'+') | Some(b'-') => &n[1..],
-                _ => &n[..],
-            };
+            let digits = n.strip_prefix(b"-").unwrap_or(n);
             if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
                 return Err(SerializeError::InvalidBigNumber);
             }

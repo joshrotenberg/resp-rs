@@ -506,8 +506,8 @@ pub enum SerializeError {
     #[error("line payload contains CR or LF")]
     LineContainsCrlf,
 
-    /// A big number is not an optional sign followed by one or more digits.
-    #[error("big number must be an optional sign followed by digits")]
+    /// A big number is not an optional `-` followed by one or more digits.
+    #[error("big number must be an optional '-' followed by digits")]
     InvalidBigNumber,
 
     /// A special float is not exactly `inf`, `-inf`, or `nan`.

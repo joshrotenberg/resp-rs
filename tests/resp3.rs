@@ -972,7 +972,7 @@ fn sibling_scalar_arms_are_unchanged() {
 }
 
 #[test]
-fn big_number_requires_optional_sign_then_digits() {
+fn big_number_requires_optional_minus_then_digits() {
     for wire in [
         &b"(\r\n"[..],
         &b"(not-a-number\r\n"[..],
@@ -981,6 +981,10 @@ fn big_number_requires_optional_sign_then_digits() {
         &b"( 12\r\n"[..],
         &b"(+\r\n"[..],
         &b"(12x\r\n"[..],
+        // A `+` sign, accepted until #104. hiredis rejects it.
+        &b"(+1\r\n"[..],
+        &b"(+3492890328409238509324850943850943825024385\r\n"[..],
+        &b"(-+1\r\n"[..],
     ] {
         assert_eq!(
             resp3::parse_frame(Bytes::copy_from_slice(wire)),
@@ -990,12 +994,14 @@ fn big_number_requires_optional_sign_then_digits() {
         );
     }
 
-    // The spec's example, unsigned and signed.
+    // The spec's example, unsigned and negative. Leading zeros and `-0` stay
+    // accepted (#104): the payload is not interpreted, and hiredis accepts them.
     for wire in [
         &b"(3492890328409238509324850943850943825024385\r\n"[..],
-        &b"(+3492890328409238509324850943850943825024385\r\n"[..],
         &b"(-3492890328409238509324850943850943825024385\r\n"[..],
         &b"(0\r\n"[..],
+        &b"(007\r\n"[..],
+        &b"(-0\r\n"[..],
     ] {
         let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
             .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
@@ -1555,4 +1561,14 @@ fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
     parser.feed(Bytes::from_static(b":+1\r\n+next\r\n"));
     assert_eq!(parser.next_frame(), Err(ParseError::InvalidFormat));
     assert_eq!(parser.next_frame(), Ok(None));
+}
+
+#[test]
+fn checked_serializer_refuses_a_plus_signed_big_number() {
+    // #104: the parser rejects it, so emitting it would not read back.
+    assert_eq!(
+        resp3::try_frame_to_bytes(&Frame::BigNumber(Bytes::from_static(b"+123"))),
+        Err(resp_rs::SerializeError::InvalidBigNumber)
+    );
+    assert!(resp3::try_frame_to_bytes(&Frame::BigNumber(Bytes::from_static(b"-123"))).is_ok());
 }

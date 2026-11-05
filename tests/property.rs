@@ -63,7 +63,8 @@ fn arb_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // a round trip the parser does not claim, since it now rejects payloads
         // that are not big numbers.
         (
-            prop::option::of(prop_oneof![Just('+'), Just('-')]),
+            // `-` only: a `+` sign is rejected since #104.
+            prop::option::of(Just('-')),
             prop::collection::vec(prop::num::u8::ANY.prop_map(|b| b'0' + b % 10), 1..40),
         )
             .prop_map(|(sign, digits)| {
@@ -844,6 +845,8 @@ fn arb_invalid_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         Just(Frame::BigNumber(Bytes::from(&b"abc"[..]))),
         Just(Frame::BigNumber(Bytes::new())),
         Just(Frame::BigNumber(Bytes::from(&b"1.5"[..]))),
+        // A `+` sign, rejected since #104.
+        Just(Frame::BigNumber(Bytes::from(&b"+123"[..]))),
         // SpecialFloat is exactly these three spellings; anything else
         // normalizes to a Double on the way back.
         Just(Frame::SpecialFloat(Bytes::from(&b"1.5"[..]))),
