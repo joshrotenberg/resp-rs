@@ -399,7 +399,13 @@
 //! rejected with [`ParseError::DepthExceeded`] past [`resp2::MAX_DEPTH`] /
 //! [`resp3::MAX_DEPTH`]. Without that bound a small input could nest deeply
 //! enough to overflow the stack, which aborts the process rather than raising a
-//! catchable panic.
+//! catchable panic. In RESP3, counted and streamed aggregates spend from the
+//! same budget.
+//!
+//! Redis can exceed the limit: a Lua script that returns a self-referencing
+//! table produces an array nested thousands of levels deep. As with any
+//! [`ParseError`] other than `Incomplete`, the rest of that reply is still on
+//! the connection, so close the connection after a `DepthExceeded`.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -423,6 +429,14 @@ pub mod codec;
 pub mod cluster;
 
 /// Errors that can occur during RESP parsing.
+///
+/// [`ParseError::Incomplete`] means more bytes are needed; read more and try
+/// again. Every other variant means the input is not a valid frame, and the
+/// position where the next frame starts is unknown. [`resp2::Parser`],
+/// [`resp3::Parser`] and the `Codec` types discard their buffered bytes on
+/// these errors, but the bytes still arriving on the connection may be the rest
+/// of the rejected frame, so they cannot be trusted as frame boundaries. Close
+/// the connection rather than continuing to read from it.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {

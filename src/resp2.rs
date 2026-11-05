@@ -61,8 +61,12 @@ const PREALLOC_CAP: usize = 128;
 /// Input nested more deeply than this is rejected with
 /// [`ParseError::DepthExceeded`].
 ///
-/// Redis does not nest replies anywhere near this deep, so the limit is not
-/// reachable by real traffic.
+/// Ordinary replies stay far below this, but Redis can exceed it: a Lua script
+/// that returns a self-referencing table makes the server emit an array nested
+/// thousands of levels deep (#106). That reply is rejected here. Like every
+/// error other than [`ParseError::Incomplete`], [`ParseError::DepthExceeded`]
+/// leaves the position of the next frame unknown, so close the connection
+/// rather than continuing to read from it.
 pub const MAX_DEPTH: u32 = 128;
 
 /// Maximum length of a single CRLF-terminated line.
@@ -554,7 +558,9 @@ impl Parser {
     /// Try to extract the next complete frame.
     ///
     /// Returns `Ok(None)` if there isn't enough data yet.
-    /// Returns `Err` on protocol errors (buffer is cleared).
+    /// Returns `Err` on protocol errors (buffer is cleared). After an error
+    /// other than `Incomplete` the stream position is unknown, so close the
+    /// connection: see [`ParseError`].
     pub fn next_frame(&mut self) -> Result<Option<Frame>, ParseError> {
         self.merge_pending();
         if self.buffer.is_empty() {
