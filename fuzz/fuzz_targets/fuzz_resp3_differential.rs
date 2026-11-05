@@ -8,8 +8,9 @@ use resp_rs::{ParseError, resp3};
 // second implementation is the only oracle here that is not closed under a
 // consistent mistake.
 //
-// RESP3 has a much larger surface, so the allowance list is thirteen entries
-// rather than two. The risk that creates is an oracle that explains away
+// RESP3 has a much larger surface, so the allowance list is fourteen entries
+// rather than two (A1 to A13 for acceptance policy, A14 for a Hash/Eq
+// inconsistency in the reference). The risk that creates is an oracle that explains away
 // everything and asserts nothing, so two allowances below are deliberately
 // narrow, and each carries a note saying which real bug a broader form would
 // have swallowed.
@@ -225,6 +226,48 @@ fn ours_map_has_duplicate_keys(f: &resp3::Frame) -> bool {
     }
 }
 
+/// A14. Signed zeros collide nondeterministically on their side. `OwnedFrame`
+/// hashes a double by `to_string()` ("0" vs "-0") but compares it with derived
+/// `PartialEq` (`0.0 == -0.0`). With Hash and Eq disagreeing, their HashSet or
+/// HashMap merges the two only when hashbrown happens to compare them, which
+/// depends on the per-process seed: measured at about 1.5% of runs for both a
+/// set and a map, never within a single run. We keep both, which is correct.
+///
+/// Narrow on purpose. It fires only when one set holds both zeros as direct
+/// elements, or one map holds both as direct keys. Their Hash panics on
+/// aggregates, so a nested `[0]` and `[-0]` never reach a HashSet and need no
+/// cover. A lone `-0`, and signed zeros as values or array elements, stay
+/// checked, so a parser that dropped the sign would still be caught.
+fn ours_has_signed_zero_collision(f: &resp3::Frame) -> bool {
+    use resp3::Frame as F;
+    fn both_zeros<'a>(mut it: impl Iterator<Item = &'a resp3::Frame>) -> bool {
+        let (mut pos, mut neg) = (false, false);
+        it.any(|x| {
+            if let F::Double(v) = x {
+                if *v == 0.0 {
+                    if v.is_sign_negative() {
+                        neg = true;
+                    } else {
+                        pos = true;
+                    }
+                }
+            }
+            pos && neg
+        })
+    }
+    match f {
+        F::Set(v) => both_zeros(v.iter()) || v.iter().any(ours_has_signed_zero_collision),
+        F::Map(v) | F::Attribute(v) => {
+            both_zeros(v.iter().map(|(k, _)| k))
+                || v.iter().any(|(k, x)| {
+                    ours_has_signed_zero_collision(k) || ours_has_signed_zero_collision(x)
+                })
+        }
+        F::Array(Some(v)) | F::Push(v) => v.iter().any(ours_has_signed_zero_collision),
+        _ => false,
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
@@ -269,6 +312,10 @@ fuzz_target!(|data: &[u8]| {
                 *their_consumed,
                 "consumed lengths differ\n  input:  {data:?}\n  ours:   {our_frame:?}\n  theirs: {their_frame:?}"
             );
+            // A14 only touches the decoded value; framing is checked above.
+            if ours_has_signed_zero_collision(our_frame) {
+                return;
+            }
             assert_eq!(
                 norm_ours(our_frame),
                 norm_theirs(their_frame),
