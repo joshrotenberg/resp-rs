@@ -1037,7 +1037,10 @@ pub use codec_impl::Codec;
 /// - Attributes inside a streamed aggregate are skipped, as they are inside a
 ///   counted one: they describe the element that follows and are not elements
 ///   themselves. An attribute directly before the `.` terminator is discarded.
-/// - Streamed and counted aggregates share one [`MAX_DEPTH`] budget.
+/// - Streamed and counted aggregates share one [`MAX_DEPTH`] budget. A
+///   streamed aggregate spends its unit even when it turns out to be empty,
+///   since that is only known at its terminator; an empty counted aggregate
+///   spends none.
 /// - Zero-copy parsing is used where possible to minimize allocations
 pub fn parse_streaming_sequence(input: Bytes) -> Result<(Frame, Bytes), ParseError> {
     if input.is_empty() {
@@ -1327,6 +1330,10 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// try_frame_to_bytes(f).is_ok()  <=>  parse_frame(frame_to_bytes(&f)) == Ok((f, empty))
 /// ```
 ///
+/// For the assembled streaming frames (`StreamedString`, `StreamedArray` and
+/// the rest), the reader is [`parse_streaming_sequence`] instead, since
+/// `parse_frame` returns only their header.
+///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 /// What that catches, beyond the CRLF case:
@@ -1339,6 +1346,9 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// | `VerbatimString { payload: b"text:x" }` | `=6\r\ntext:x\r\n` | rejected |
 /// | `StreamedString` with an empty chunk | mid-stream `;0\r\n` | truncated |
 /// | `Attribute` inside an aggregate | slot skipped | one element short |
+/// | `StreamedAttribute` inside a streamed aggregate | slot skipped | one element short |
+/// | `StreamedArrayHeader` inside a streamed aggregate | `*?\r\n` | following elements read as its body |
+/// | `StreamedArray` inside a counted aggregate | `*?\r\n...` | bare header, body left over |
 ///
 /// # Scope
 ///
@@ -1504,6 +1514,10 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
             // truncates the stream in place.
             if chunks.iter().any(|c| c.is_empty()) {
                 return Err(SerializeError::EmptyStreamedChunk);
+            }
+            // Each chunk is length-prefixed and bounded like a bulk string.
+            for chunk in chunks {
+                check_bulk_payload(chunk)?;
             }
             serialize_frame(frame, buf);
         }

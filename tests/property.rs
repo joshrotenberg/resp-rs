@@ -173,6 +173,14 @@ fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // Skipped by the parser inside a streamed aggregate, like a counted
         // attribute (#98).
         1 => Just(Frame::StreamedAttribute(vec![])),
+        1 => Just(Frame::StreamedAttribute(vec![(Frame::Integer(1), Frame::Null)])),
+        // Pass through unchanged inside a streamed aggregate: a chunk is an
+        // ordinary element there, and RESP3 defines no body for `=?` or `!?`.
+        1 => Just(Frame::StreamedStringChunk(Bytes::from_static(b"abc"))),
+        1 => Just(Frame::StreamedVerbatimStringHeader),
+        1 => Just(Frame::StreamedBlobErrorHeader),
+        // Nesting more than one level, and the remaining streamed kinds.
+        1 => Just(Frame::StreamedSet(vec![Frame::StreamedPush(vec![Frame::Integer(1)])])),
         // The over-length case for #82 is deliberately NOT here. It found the
         // bug, but a 64 KB payload allocated on every generated case is a real
         // cost, and it shrinks to a 65 KB literal in the regressions file. The

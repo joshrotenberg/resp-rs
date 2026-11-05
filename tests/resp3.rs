@@ -1324,3 +1324,60 @@ fn checked_serializer_follows_the_streamed_element_rules() {
         Err(SerializeError::NestedStreamingFrame)
     );
 }
+
+#[test]
+fn nested_streamed_wire_consumes_exactly_its_length() {
+    // Every strict prefix is incomplete, and the full wire is consumed exactly,
+    // with whatever follows left in `rest`.
+    let cases: [&[u8]; 5] = [
+        b"*?\r\n*?\r\n:1\r\n.\r\n.\r\n",
+        b"*?\r\n$?\r\n;3\r\nabc\r\n;0\r\n:1\r\n.\r\n",
+        b"%?\r\n+k\r\n~?\r\n:1\r\n.\r\n>?\r\n:2\r\n.\r\n+v\r\n.\r\n",
+        b"*?\r\n|1\r\n+a\r\n:1\r\n:2\r\n|?\r\n+b\r\n:3\r\n.\r\n.\r\n",
+        b"~?\r\n*1\r\n%1\r\n+k\r\n+v\r\n.\r\n",
+    ];
+    for wire in cases {
+        for cut in 0..wire.len() {
+            assert_eq!(
+                resp3::parse_streaming_sequence(Bytes::copy_from_slice(&wire[..cut])),
+                Err(ParseError::Incomplete),
+                "prefix of {} bytes of {:?}",
+                cut,
+                Bytes::from_static(wire)
+            );
+        }
+        let mut full = wire.to_vec();
+        full.extend_from_slice(b"+next\r\n");
+        let (_, rest) = resp3::parse_streaming_sequence(Bytes::from(full)).unwrap();
+        assert_eq!(rest, Bytes::from_static(b"+next\r\n"));
+    }
+}
+
+#[test]
+fn counted_aggregate_inside_streamed_one_at_the_depth_limit() {
+    // One streamed level plus 127 counted levels is exactly MAX_DEPTH.
+    let depth = resp3::MAX_DEPTH as usize;
+    let wire = format!("*?\r\n{}:1\r\n.\r\n", "*1\r\n".repeat(depth - 1));
+    let (frame, rest) = resp3::parse_streaming_sequence(Bytes::from(wire)).unwrap();
+    assert!(matches!(frame, Frame::StreamedArray(_)));
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn chunks_and_headers_without_a_body_pass_through_streamed_aggregates() {
+    // A chunk is an ordinary element of a streamed array, and `=?` / `!?`
+    // have no chunk format, so they come back as bare headers.
+    let (frame, rest) = seq("*?\r\n;3\r\nabc\r\n=?\r\n!?\r\n:1\r\n.\r\n");
+    assert_eq!(
+        frame,
+        Frame::StreamedArray(vec![
+            Frame::StreamedStringChunk(Bytes::from_static(b"abc")),
+            Frame::StreamedVerbatimStringHeader,
+            Frame::StreamedBlobErrorHeader,
+            int(1),
+        ])
+    );
+    assert!(rest.is_empty());
+    let bytes = resp3::try_frame_to_bytes(&frame).unwrap();
+    assert_eq!(resp3::parse_streaming_sequence(bytes).unwrap().0, frame);
+}
