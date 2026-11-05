@@ -1611,6 +1611,30 @@ fn write_len(n: usize, buf: &mut BytesMut) {
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Write the text of a double: fixed notation for decimal exponents in
+/// `-6..=20`, exponent notation outside it.
+///
+/// `f64::to_string` never uses an exponent, so on its own it writes
+/// `5e-324` as a 326-byte decimal and `f64::MAX` as 309 digits. hiredis rejects
+/// a double line of 326 bytes or more (#100). The range is the one JavaScript's
+/// `Number.prototype.toString` uses, so ordinary values (`3`, `0.001`, `-0`,
+/// `1e20` as `100000000000000000000`) are written exactly as before, and the
+/// output is bounded at about 25 bytes. Both notations use the shortest digits
+/// that round-trip, and the parser accepts both.
+fn write_double(d: f64, buf: &mut BytesMut) {
+    let sci = alloc::format!("{d:e}");
+    // Non-finite values have no `e` and keep the fixed form, as before.
+    let exp = sci
+        .rsplit_once('e')
+        .and_then(|(_, e)| e.parse::<i32>().ok())
+        .unwrap_or(0);
+    if (-6..=20).contains(&exp) {
+        buf.extend_from_slice(d.to_string().as_bytes());
+    } else {
+        buf.extend_from_slice(sci.as_bytes());
+    }
+}
+
 fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
     match frame {
         Frame::SimpleString(s) => {
@@ -1746,8 +1770,7 @@ fn serialize_frame(frame: &Frame, buf: &mut BytesMut) {
         }
         Frame::Double(d) => {
             buf.put_u8(b',');
-            let s = d.to_string();
-            buf.extend_from_slice(s.as_bytes());
+            write_double(*d, buf);
             buf.extend_from_slice(b"\r\n");
         }
         Frame::SpecialFloat(f) => {
@@ -2362,6 +2385,64 @@ mod tests {
         // between parsing and serializing due to formatting differences
         let (reparsed, _) = parse_frame(serialized).unwrap();
         assert_eq!(frame, reparsed);
+    }
+
+    /// #100: fixed notation inside decimal exponents -6..=20, exponent
+    /// notation outside, so no double line reaches hiredis's 326-byte limit.
+    #[test]
+    fn test_double_notation_by_exponent() {
+        let cases: &[(f64, &str)] = &[
+            (3.0, ",3\r\n"),
+            (-0.0, ",-0\r\n"),
+            (0.001, ",0.001\r\n"),
+            (0.000001, ",0.000001\r\n"),
+            (1.5e-7, ",1.5e-7\r\n"),
+            (1e20, ",100000000000000000000\r\n"),
+            (1e21, ",1e21\r\n"),
+            (-1e21, ",-1e21\r\n"),
+            (0.1 + 0.2, ",0.30000000000000004\r\n"),
+            (f64::MAX, ",1.7976931348623157e308\r\n"),
+            (f64::MIN_POSITIVE, ",2.2250738585072014e-308\r\n"),
+            (5e-324, ",5e-324\r\n"),
+            (-5e-324, ",-5e-324\r\n"),
+        ];
+        for &(v, want) in cases {
+            let frame = Frame::Double(v);
+            assert_eq!(frame_to_bytes(&frame), Bytes::from(want), "{v:e}");
+            assert_eq!(
+                super::try_frame_to_bytes(&frame).unwrap(),
+                Bytes::from(want),
+                "{v:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_double_edge_magnitudes_roundtrip_bit_exact() {
+        let values = [
+            f64::MAX,
+            -f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::EPSILON,
+            1e-7,
+            9.5e-7,
+            1e-6,
+            9.5e20,
+            1e21,
+            123456789.12345678,
+            -0.0,
+        ];
+        for v in values {
+            let wire = frame_to_bytes(&Frame::Double(v));
+            assert!(wire.len() <= 30, "{v:e} serialized to {} bytes", wire.len());
+            let (back, rest) = parse_frame(wire.clone()).unwrap();
+            assert!(rest.is_empty());
+            match back {
+                Frame::Double(b) => assert_eq!(b.to_bits(), v.to_bits(), "{wire:?}"),
+                other => panic!("{v:e} came back as {other:?}"),
+            }
+        }
     }
 
     #[test]
