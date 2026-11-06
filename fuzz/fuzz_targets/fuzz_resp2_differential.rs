@@ -139,7 +139,8 @@ fn has_rejected_line_text(data: &[u8], consumed: usize) -> bool {
         text.first() == Some(&b'+')
             || (digits.first() == Some(&b'0') && (digits.len() > 1 || digits.len() != text.len()))
     }
-    // Returns whether rejected line text was found, and where the frame ends. `None` (no excuse) past MAX_DEPTH, which this crate rejects anyway.
+    // Returns whether rejected line text was found, and where the frame ends.
+    // `None` (no excuse) past MAX_DEPTH, which this crate rejects anyway.
     fn walk(data: &[u8], pos: usize, depth: u32) -> Option<(bool, usize)> {
         if depth > resp2::MAX_DEPTH {
             return None;

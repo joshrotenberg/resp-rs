@@ -362,10 +362,12 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 ///
 /// # Scope
 ///
-/// Grammar validity only. The parse-side resource limits ([`MAX_DEPTH`],
-/// [`MAX_LINE_LENGTH`], and the collection and bulk size caps) also stop a
-/// frame from parsing back, but they bound what a peer may send rather than
-/// what a `Frame` may represent, so they are deliberately not checked here.
+/// Grammar validity, plus the two size ceilings that apply to a single payload:
+/// a line over [`MAX_LINE_LENGTH`] is `LineTooLong` and a length-prefixed body
+/// over the bulk cap is `PayloadTooLong` (#82). The other parse-side limits
+/// ([`MAX_DEPTH`] and the collection size cap) also stop a frame from parsing
+/// back, but they bound the shape of what a peer may send rather than what one
+/// `Frame` value holds, so they are deliberately not checked here.
 ///
 /// # Examples
 ///
@@ -406,6 +408,10 @@ fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
     if payload.iter().any(|&b| b == b'\r' || b == b'\n') {
         return Err(SerializeError::LineContainsCrlf);
     }
+    // The parser's own ceiling, as in RESP3 (#82).
+    if payload.len() > MAX_LINE_LENGTH {
+        return Err(SerializeError::LineTooLong);
+    }
     Ok(())
 }
 
@@ -425,9 +431,15 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
             buf.extend_from_slice(e);
             buf.extend_from_slice(b"\r\n");
         }
-        // Integers are written from i64, and bulk strings are length-prefixed
-        // and read back by length, so neither can misrepresent itself.
-        Frame::Integer(_) | Frame::BulkString(_) => serialize_frame(frame, buf),
+        // Integers are written from i64 and cannot misrepresent themselves.
+        Frame::Integer(_) | Frame::BulkString(None) => serialize_frame(frame, buf),
+        // Read back by length, but the parser bounds the length (#82).
+        Frame::BulkString(Some(b)) => {
+            if b.len() > MAX_BULK_STRING_SIZE {
+                return Err(SerializeError::PayloadTooLong);
+            }
+            serialize_frame(frame, buf);
+        }
         Frame::Array(Some(items)) => {
             buf.put_u8(b'*');
             let len = items.len().to_string();
@@ -614,7 +626,15 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
         }
         i += 1;
     }
-    if len - from > MAX_LINE_LENGTH {
+    // A trailing `\r` may be the first half of the terminator, so it is not
+    // counted: a line of exactly MAX_LINE_LENGTH bytes split between its `\r`
+    // and `\n` would otherwise fail in a chunked feed but parse whole.
+    let pending = if len > from && buf[len - 1] == b'\r' {
+        len - 1 - from
+    } else {
+        len - from
+    };
+    if pending > MAX_LINE_LENGTH {
         // Already past the ceiling with no terminator, so no CRLF arriving
         // later could bring it back into range. Reporting that rather than
         // `Incomplete` is what lets `Parser` drop the buffer instead of growing
@@ -630,6 +650,11 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
 /// One pass: a `\r\n` pair ends the line, and any other `\r` or `\n` is
 /// `InvalidFormat`, except a `\r` as the last buffered byte, whose `\n` may
 /// still arrive. The specs forbid both bytes here and hiredis rejects them.
+///
+/// Every verdict depends only on the bytes before the one that decides it, so
+/// a frame split at any byte gets the same result as the whole buffer. That is
+/// why a bare byte past the line ceiling is `LineTooLong`: a chunked feed that
+/// stopped just before it would already have reported that.
 #[inline]
 fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
     let len = buf.len();
@@ -643,11 +668,19 @@ fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseErro
                 }
                 return Ok((i, i + 2));
             }
-            b'\r' | b'\n' => return Err(ParseError::InvalidFormat),
+            b'\r' | b'\n' => {
+                return Err(if i - from > MAX_LINE_LENGTH {
+                    ParseError::LineTooLong
+                } else {
+                    ParseError::InvalidFormat
+                });
+            }
             _ => i += 1,
         }
     }
-    if len - from > MAX_LINE_LENGTH {
+    // `i` stops short of `len` only at a trailing `\r`, which is not counted,
+    // as in `find_crlf`.
+    if i - from > MAX_LINE_LENGTH {
         return Err(ParseError::LineTooLong);
     }
     Err(ParseError::Incomplete)

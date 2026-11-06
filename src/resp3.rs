@@ -1248,7 +1248,15 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
         }
         i += 1;
     }
-    if len - from > MAX_LINE_LENGTH {
+    // A trailing `\r` may be the first half of the terminator, so it is not
+    // counted: a line of exactly MAX_LINE_LENGTH bytes split between its `\r`
+    // and `\n` would otherwise fail in a chunked feed but parse whole.
+    let pending = if len > from && buf[len - 1] == b'\r' {
+        len - 1 - from
+    } else {
+        len - from
+    };
+    if pending > MAX_LINE_LENGTH {
         // Already past the ceiling with no terminator, so no CRLF arriving
         // later could bring it back into range. Reporting that rather than
         // `Incomplete` is what lets `Parser` drop the buffer instead of growing
@@ -1264,6 +1272,11 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
 /// One pass: a `\r\n` pair ends the line, and any other `\r` or `\n` is
 /// `InvalidFormat`, except a `\r` as the last buffered byte, whose `\n` may
 /// still arrive. The specs forbid both bytes here and hiredis rejects them.
+///
+/// Every verdict depends only on the bytes before the one that decides it, so
+/// a frame split at any byte gets the same result as the whole buffer. That is
+/// why a bare byte past the line ceiling is `LineTooLong`: a chunked feed that
+/// stopped just before it would already have reported that.
 #[inline]
 fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
     let len = buf.len();
@@ -1277,11 +1290,19 @@ fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseErro
                 }
                 return Ok((i, i + 2));
             }
-            b'\r' | b'\n' => return Err(ParseError::InvalidFormat),
+            b'\r' | b'\n' => {
+                return Err(if i - from > MAX_LINE_LENGTH {
+                    ParseError::LineTooLong
+                } else {
+                    ParseError::InvalidFormat
+                });
+            }
             _ => i += 1,
         }
     }
-    if len - from > MAX_LINE_LENGTH {
+    // `i` stops short of `len` only at a trailing `\r`, which is not counted,
+    // as in `find_crlf`.
+    if i - from > MAX_LINE_LENGTH {
         return Err(ParseError::LineTooLong);
     }
     Err(ParseError::Incomplete)
@@ -1431,7 +1452,7 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 ///
 /// | Frame | Unchecked wire | Comes back as |
 /// | --- | --- | --- |
-/// | `SimpleString(b"a\nb")` | `+a\nb\r\n` | parses here, rejected by hiredis |
+/// | `SimpleString(b"a\nb")` | `+a\nb\r\n` | rejected (#99) |
 /// | `BigNumber(b"abc")` | `(abc\r\n` | rejected |
 /// | `SpecialFloat(b"1.5")` | `,1.5\r\n` | `Double(1.5)` |
 /// | `Double(f64::NAN)` | `,NaN\r\n` | `SpecialFloat(b"nan")` |
@@ -1444,10 +1465,12 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 ///
 /// # Scope
 ///
-/// Grammar validity only. The parse-side resource limits ([`MAX_DEPTH`],
-/// [`MAX_LINE_LENGTH`], and the collection and bulk size caps) also stop a
-/// frame from parsing back, but they bound what a peer may send rather than
-/// what a `Frame` may represent, so they are deliberately not checked here.
+/// Grammar validity, plus the two size ceilings that apply to a single payload:
+/// a line over [`MAX_LINE_LENGTH`] is `LineTooLong` and a length-prefixed body
+/// over the bulk cap is `PayloadTooLong` (#82). The other parse-side limits
+/// ([`MAX_DEPTH`] and the collection size cap) also stop a frame from parsing
+/// back, but they bound the shape of what a peer may send rather than what one
+/// `Frame` value holds, so they are deliberately not checked here.
 ///
 /// # Examples
 ///
@@ -1571,6 +1594,10 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
             let digits = n.strip_prefix(b"-").unwrap_or(n);
             if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
                 return Err(SerializeError::InvalidBigNumber);
+            }
+            // A line, so bounded by the same ceiling as a simple string.
+            if n.len() > MAX_LINE_LENGTH {
+                return Err(SerializeError::LineTooLong);
             }
             serialize_frame(frame, buf);
         }

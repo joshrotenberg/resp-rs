@@ -220,6 +220,9 @@ fn arb_resp3_frame_any() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // A bare LF or CR, which safe_line_bytes never produces (#99).
         1 => Just(Frame::Error(Bytes::from_static(b"ERR a\nb"))),
         1 => Just(Frame::SimpleString(Bytes::from_static(b"a\rb"))),
+        // Accepted as they are: leading zeros and -0 on big numbers (#104).
+        1 => Just(Frame::BigNumber(Bytes::from_static(b"007"))),
+        1 => Just(Frame::BigNumber(Bytes::from_static(b"-0"))),
     ];
 
     prop_oneof![
@@ -771,6 +774,9 @@ fn arb_invalid_resp3_frame() -> impl Strategy<Value = resp_rs::resp3::Frame> {
         // normalizes to a Double on the way back.
         Just(Frame::SpecialFloat(Bytes::from(&b"1.5"[..]))),
         Just(Frame::SpecialFloat(Bytes::from(&b"INF"[..]))),
+        // Parsed and normalized to `nan` (#103), so not representable as is.
+        Just(Frame::SpecialFloat(Bytes::from(&b"-nan"[..]))),
+        Just(Frame::SpecialFloat(Bytes::from(&b"NaN"[..]))),
         // Non-finite doubles come back as SpecialFloat, changing type.
         Just(Frame::Double(f64::NAN)),
         Just(Frame::Double(f64::INFINITY)),

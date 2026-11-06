@@ -1671,3 +1671,90 @@ fn double_finite_forms_unchanged() {
         }
     }
 }
+
+/// Feed `wire` to a fresh Parser split at `cut`, and return the first
+/// non-`Ok(None)` result, or `Ok(None)` if both halves leave it incomplete.
+fn feed_split_resp3(wire: &[u8], cut: usize) -> Result<Option<Frame>, ParseError> {
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::copy_from_slice(&wire[..cut]));
+    match parser.next_frame() {
+        Ok(None) => {}
+        other => return other,
+    }
+    parser.feed(Bytes::copy_from_slice(&wire[cut..]));
+    parser.next_frame()
+}
+
+#[test]
+fn bare_cr_or_lf_is_rejected_at_every_split() {
+    // #99: a chunked feed must reach the same verdict as the whole buffer.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"+ab\r\rx\r\n"[..],
+    ] {
+        for cut in 0..=wire.len() {
+            assert_eq!(
+                feed_split_resp3(wire, cut),
+                Err(ParseError::InvalidFormat),
+                "{:?} cut at {cut}",
+                Bytes::copy_from_slice(wire)
+            );
+        }
+    }
+}
+
+#[test]
+fn line_at_the_ceiling_parses_at_every_split_near_its_end() {
+    // A line of exactly MAX_LINE_LENGTH bytes is accepted whole, so it must be
+    // accepted when split anywhere, including between its CR and LF, where the
+    // trailing CR used to be counted toward the limit.
+    let mut wire = vec![b'+'];
+    wire.extend(core::iter::repeat_n(b'a', resp3::MAX_LINE_LENGTH));
+    wire.extend_from_slice(b"\r\n");
+    for cut in wire.len() - 4..=wire.len() {
+        assert!(
+            matches!(
+                feed_split_resp3(&wire, cut),
+                Ok(Some(Frame::SimpleString(_)))
+            ),
+            "cut at {cut} of {}",
+            wire.len()
+        );
+    }
+}
+
+#[test]
+fn bare_byte_past_the_ceiling_is_line_too_long_at_every_split() {
+    // Past the ceiling a chunked feed reports LineTooLong before it sees the
+    // bare byte, so the whole buffer must say the same.
+    for bad in *b"\n\r" {
+        let mut wire = vec![b'+'];
+        wire.extend(core::iter::repeat_n(b'a', resp3::MAX_LINE_LENGTH + 1));
+        wire.push(bad);
+        wire.extend_from_slice(b"x\r\n");
+        assert_eq!(
+            resp3::parse_frame(Bytes::from(wire.clone())),
+            Err(ParseError::LineTooLong)
+        );
+        for cut in wire.len() - 6..=wire.len() {
+            assert_eq!(
+                feed_split_resp3(&wire, cut),
+                Err(ParseError::LineTooLong),
+                "cut at {cut}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_serializer_refuses_a_big_number_over_the_line_ceiling() {
+    let over = Frame::BigNumber(Bytes::from(vec![b'7'; resp3::MAX_LINE_LENGTH + 1]));
+    assert_eq!(
+        resp3::try_frame_to_bytes(&over),
+        Err(resp_rs::SerializeError::LineTooLong)
+    );
+    let at = Frame::BigNumber(Bytes::from(vec![b'7'; resp3::MAX_LINE_LENGTH]));
+    let bytes = resp3::try_frame_to_bytes(&at).unwrap();
+    assert_eq!(resp3::parse_frame(bytes).unwrap().0, at);
+}

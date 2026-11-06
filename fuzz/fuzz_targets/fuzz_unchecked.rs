@@ -12,6 +12,10 @@ use resp_rs::{resp2, resp3};
 // `resp-rs` with no `features` key, so `parse_frame_unchecked` was not compiled
 // into any fuzz binary at all. The axis existed and was unreachable.
 //
+// A bare CR in a simple string or error is invalid input since #99, so that
+// exact case is now gated out below; the agreement on CRLF scanning it forced
+// still matters for every other line type.
+//
 // The unchecked parsers are only defined on input the safe parser accepts, so
 // every case is gated on a successful safe parse first. Feeding them anything
 // else is undefined behavior, not a finding.

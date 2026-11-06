@@ -256,7 +256,7 @@ a bare `\r` or `\n` in a simple string or error payload, returning
 `SerializeError::LineContainsCrlf` as for a CRLF pair. The specs forbid both
 there and hiredis rejects them. A server that reflects user input into an error
 reply should replace them first; Redis maps each to a space. The parser still
-accepts them on input.
+accepts them on input in 0.3.2; 0.4 rejects them there too (see above).
 
 `resp3::parse_streaming_sequence` assembles a streamed value nested directly in
 a streamed aggregate, where it used to return the header and misreport the
