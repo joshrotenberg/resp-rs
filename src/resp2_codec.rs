@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn encode_refuses_a_bare_cr_or_lf_in_a_line_payload() {
-        // #99. These parse back here but the specs forbid them and hiredis
+        // #99. The parser rejects these too; the specs forbid them and hiredis
         // rejects them, so a reply echoing user input must not carry one.
         for reply in [
             Frame::Error(Bytes::from_static(b"ERR unknown command 'a\nb'")),

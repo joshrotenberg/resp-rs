@@ -148,25 +148,21 @@ unsafe fn parse_inner(input: &Bytes, pos: usize) -> (Frame, usize) {
         b',' => {
             let cr = find_cr(buf, pos + 1);
             let line = buf.get_unchecked(pos + 1..cr);
-            if line == b"inf" || line == b"-inf" || line == b"nan" {
-                return (Frame::SpecialFloat(input.slice(pos + 1..cr)), cr + 2);
+            // Same special-value rule as the safe parser, case variants and
+            // `-nan` included. Matching only the exact spellings here once made
+            // `,Inf\r\n` come back as Double(inf) instead of SpecialFloat.
+            if let Some(canonical) = crate::resp3::special_float(line) {
+                let frame = if line == canonical {
+                    Frame::SpecialFloat(input.slice(pos + 1..cr))
+                } else {
+                    Frame::SpecialFloat(Bytes::from_static(canonical))
+                };
+                return (frame, cr + 2);
             }
             let s = core::str::from_utf8_unchecked(line);
+            // Valid input is finite here: the safe parser rejects any other
+            // non-finite literal (#103).
             let v: f64 = s.parse().unwrap_unchecked();
-            // The safe parser canonicalizes any non-finite value to a
-            // SpecialFloat, so spellings the exact-match above misses, such as
-            // `Inf` or `NaN`, still land there. Without this, `,Inf\r\n` gave
-            // SpecialFloat("inf") safely and Double(inf) here.
-            if v.is_infinite() || v.is_nan() {
-                let canonical = if v.is_nan() {
-                    "nan"
-                } else if v.is_sign_negative() {
-                    "-inf"
-                } else {
-                    "inf"
-                };
-                return (Frame::SpecialFloat(Bytes::from(canonical)), cr + 2);
-            }
             (Frame::Double(v), cr + 2)
         }
         b'#' => {
@@ -387,7 +383,8 @@ mod tests {
             ",Inf\r\n",
             ",NaN\r\n",
             ",-Inf\r\n",
-            ",infinity\r\n",
+            ",-nan\r\n",
+            ",NAN\r\n",
             "%1\r\n+key\r\n:1\r\n",
             "|1\r\n+meta\r\n+val\r\n",
             ">2\r\n+msg\r\n+data\r\n",
@@ -396,10 +393,7 @@ mod tests {
             "*?\r\n",
             ";5\r\nhello\r\n",
             ";0\r\n",
-            // Bare CR inside a payload is data, not a line terminator (#65).
-            "+a\rb\r\n",
-            "-a\rb\r\n",
-            "*2\r\n+a\rZ+b\r\n+x\r\n",
+            // The bare-CR payloads from #65 were here; invalid input since #99.
         ];
 
         for wire in cases {

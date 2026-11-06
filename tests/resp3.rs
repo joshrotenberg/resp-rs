@@ -972,7 +972,7 @@ fn sibling_scalar_arms_are_unchanged() {
 }
 
 #[test]
-fn big_number_requires_optional_sign_then_digits() {
+fn big_number_requires_optional_minus_then_digits() {
     for wire in [
         &b"(\r\n"[..],
         &b"(not-a-number\r\n"[..],
@@ -981,6 +981,10 @@ fn big_number_requires_optional_sign_then_digits() {
         &b"( 12\r\n"[..],
         &b"(+\r\n"[..],
         &b"(12x\r\n"[..],
+        // A `+` sign, accepted until #104. hiredis rejects it.
+        &b"(+1\r\n"[..],
+        &b"(+3492890328409238509324850943850943825024385\r\n"[..],
+        &b"(-+1\r\n"[..],
     ] {
         assert_eq!(
             resp3::parse_frame(Bytes::copy_from_slice(wire)),
@@ -990,12 +994,14 @@ fn big_number_requires_optional_sign_then_digits() {
         );
     }
 
-    // The spec's example, unsigned and signed.
+    // The spec's example, unsigned and negative. Leading zeros and `-0` stay
+    // accepted (#104): the payload is not interpreted, and hiredis accepts them.
     for wire in [
         &b"(3492890328409238509324850943850943825024385\r\n"[..],
-        &b"(+3492890328409238509324850943850943825024385\r\n"[..],
         &b"(-3492890328409238509324850943850943825024385\r\n"[..],
         &b"(0\r\n"[..],
+        &b"(007\r\n"[..],
+        &b"(-0\r\n"[..],
     ] {
         let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
             .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
@@ -1523,22 +1529,36 @@ fn bare_cr_or_lf_in_every_line_position_is_refused() {
 }
 
 #[test]
-fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
-    // The checked serializer is stricter than the parser here until the parser
-    // side of #99 lands in 0.4. If this starts failing, the exception in the
-    // try_frame_to_bytes docs and the iff property tests can go.
-    for (wire, frame) in [
-        (&b"+a\rb\r\n"[..], simple("a\rb")),
-        (b"+a\nb\r\n", simple("a\nb")),
-        (
-            b"-ERR a\nb\r\n",
-            Frame::Error(Bytes::from_static(b"ERR a\nb")),
-        ),
+fn parser_rejects_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid both in simple strings and errors, and hiredis
+    // rejects them. Until 0.4 the parser read them back as payload.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"+a\nb\r\n"[..],
+        &b"+a\r\r\n"[..],
+        &b"+\n\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"-ERR a\rb\r\n"[..],
+        &b"*2\r\n+ok\r\n+a\rb\r\n"[..],
+        // No terminator yet, but a bare LF can never become valid.
+        &b"+a\nb"[..],
+        &b"+a\rb"[..],
     ] {
-        let (parsed, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire)).unwrap();
-        assert_eq!(parsed, frame);
-        assert!(rest.is_empty());
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{:?}",
+            Bytes::copy_from_slice(wire)
+        );
     }
+    // A CR as the last buffered byte may be the start of the terminator.
+    assert_eq!(
+        resp3::parse_frame(Bytes::from_static(b"+abc\r")),
+        Err(ParseError::Incomplete)
+    );
+    // Other line types are unaffected: a bulk string carries any bytes.
+    let (frame, _) = resp3::parse_frame(Bytes::from_static(b"$3\r\na\rb\r\n")).unwrap();
+    assert_eq!(frame, Frame::BulkString(Some(Bytes::from_static(b"a\rb"))));
 }
 
 #[test]
@@ -1555,4 +1575,186 @@ fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
     parser.feed(Bytes::from_static(b":+1\r\n+next\r\n"));
     assert_eq!(parser.next_frame(), Err(ParseError::InvalidFormat));
     assert_eq!(parser.next_frame(), Ok(None));
+}
+
+#[test]
+fn checked_serializer_refuses_a_plus_signed_big_number() {
+    // #104: the parser rejects it, so emitting it would not read back.
+    assert_eq!(
+        resp3::try_frame_to_bytes(&Frame::BigNumber(Bytes::from_static(b"+123"))),
+        Err(resp_rs::SerializeError::InvalidBigNumber)
+    );
+    assert!(resp3::try_frame_to_bytes(&Frame::BigNumber(Bytes::from_static(b"-123"))).is_ok());
+}
+
+#[test]
+fn double_special_values_and_tolerated_variants() {
+    // #103. The spec's spellings, plus `-nan` and case variants, which it says
+    // clients must tolerate from Redis before 7.2.
+    for (wire, want) in [
+        (&b",inf\r\n"[..], &b"inf"[..]),
+        (b",-inf\r\n", b"-inf"),
+        (b",nan\r\n", b"nan"),
+        (b",-nan\r\n", b"nan"),
+        (b",INF\r\n", b"inf"),
+        (b",Inf\r\n", b"inf"),
+        (b",-INF\r\n", b"-inf"),
+        (b",NaN\r\n", b"nan"),
+        (b",NAN\r\n", b"nan"),
+        (b",-NaN\r\n", b"nan"),
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        assert_eq!(
+            frame,
+            Frame::SpecialFloat(Bytes::copy_from_slice(want)),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn double_rejects_other_non_finite_text() {
+    // #103. `str::parse` accepts all of these; Redis never sends them, and
+    // hiredis rejects them. An overflowing literal is not quietly `inf`.
+    for wire in [
+        &b",infinity\r\n"[..],
+        &b",Infinity\r\n"[..],
+        &b",-infinity\r\n"[..],
+        &b",+inf\r\n"[..],
+        &b",+INF\r\n"[..],
+        &b",+nan\r\n"[..],
+        &b",+infinity\r\n"[..],
+        &b",1e309\r\n"[..],
+        &b",-1e309\r\n"[..],
+        &b",179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792\r\n"[..],
+        &b",nan(0x1)\r\n"[..],
+        &b",in\r\n"[..],
+    ] {
+        assert_eq!(
+            resp3::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+}
+
+#[test]
+fn double_finite_forms_unchanged() {
+    // #103 option 2 leaves these alone, although the RESP3 grammar excludes the
+    // ones without integral and fractional digits on both sides.
+    for (wire, want) in [
+        (&b",1.5\r\n"[..], 1.5f64),
+        (b",-0.0\r\n", -0.0),
+        (b",1e308\r\n", 1e308),
+        (b",5e-324\r\n", 5e-324),
+        (b",1e-400\r\n", 0.0),
+        (b",.5\r\n", 0.5),
+        (b",1.\r\n", 1.0),
+        (b",+1.5\r\n", 1.5),
+        (b",01.5\r\n", 1.5),
+    ] {
+        let (frame, rest) = resp3::parse_frame(Bytes::copy_from_slice(wire))
+            .unwrap_or_else(|e| panic!("{}: {e:?}", String::from_utf8_lossy(wire)));
+        assert!(rest.is_empty());
+        match frame {
+            Frame::Double(v) => assert_eq!(
+                v.to_bits(),
+                want.to_bits(),
+                "{}",
+                String::from_utf8_lossy(wire)
+            ),
+            other => panic!("{}: {other:?}", String::from_utf8_lossy(wire)),
+        }
+    }
+}
+
+/// Feed `wire` to a fresh Parser split at `cut`, and return the first
+/// non-`Ok(None)` result, or `Ok(None)` if both halves leave it incomplete.
+fn feed_split_resp3(wire: &[u8], cut: usize) -> Result<Option<Frame>, ParseError> {
+    let mut parser = resp3::Parser::new();
+    parser.feed(Bytes::copy_from_slice(&wire[..cut]));
+    match parser.next_frame() {
+        Ok(None) => {}
+        other => return other,
+    }
+    parser.feed(Bytes::copy_from_slice(&wire[cut..]));
+    parser.next_frame()
+}
+
+#[test]
+fn bare_cr_or_lf_is_rejected_at_every_split() {
+    // #99: a chunked feed must reach the same verdict as the whole buffer.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"+ab\r\rx\r\n"[..],
+    ] {
+        for cut in 0..=wire.len() {
+            assert_eq!(
+                feed_split_resp3(wire, cut),
+                Err(ParseError::InvalidFormat),
+                "{:?} cut at {cut}",
+                Bytes::copy_from_slice(wire)
+            );
+        }
+    }
+}
+
+#[test]
+fn line_at_the_ceiling_parses_at_every_split_near_its_end() {
+    // A line of exactly MAX_LINE_LENGTH bytes is accepted whole, so it must be
+    // accepted when split anywhere, including between its CR and LF, where the
+    // trailing CR used to be counted toward the limit.
+    let mut wire = vec![b'+'];
+    wire.extend(core::iter::repeat_n(b'a', resp3::MAX_LINE_LENGTH));
+    wire.extend_from_slice(b"\r\n");
+    for cut in wire.len() - 4..=wire.len() {
+        assert!(
+            matches!(
+                feed_split_resp3(&wire, cut),
+                Ok(Some(Frame::SimpleString(_)))
+            ),
+            "cut at {cut} of {}",
+            wire.len()
+        );
+    }
+}
+
+#[test]
+fn bare_byte_past_the_ceiling_is_line_too_long_at_every_split() {
+    // Past the ceiling a chunked feed reports LineTooLong before it sees the
+    // bare byte, so the whole buffer must say the same.
+    for bad in *b"\n\r" {
+        let mut wire = vec![b'+'];
+        wire.extend(core::iter::repeat_n(b'a', resp3::MAX_LINE_LENGTH + 1));
+        wire.push(bad);
+        wire.extend_from_slice(b"x\r\n");
+        assert_eq!(
+            resp3::parse_frame(Bytes::from(wire.clone())),
+            Err(ParseError::LineTooLong)
+        );
+        for cut in wire.len() - 6..=wire.len() {
+            assert_eq!(
+                feed_split_resp3(&wire, cut),
+                Err(ParseError::LineTooLong),
+                "cut at {cut}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_serializer_refuses_a_big_number_over_the_line_ceiling() {
+    let over = Frame::BigNumber(Bytes::from(vec![b'7'; resp3::MAX_LINE_LENGTH + 1]));
+    assert_eq!(
+        resp3::try_frame_to_bytes(&over),
+        Err(resp_rs::SerializeError::LineTooLong)
+    );
+    let at = Frame::BigNumber(Bytes::from(vec![b'7'; resp3::MAX_LINE_LENGTH]));
+    let bytes = resp3::try_frame_to_bytes(&at).unwrap();
+    assert_eq!(resp3::parse_frame(bytes).unwrap().0, at);
 }

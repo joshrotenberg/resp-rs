@@ -623,24 +623,36 @@ fn checked_serializer_refuses_a_bare_cr_or_lf_in_line_payloads() {
 }
 
 #[test]
-fn parser_still_reads_a_bare_cr_or_lf_in_line_payloads() {
-    // The checked serializer is stricter than the parser here until the parser
-    // side of #99 lands in 0.4. If this starts failing, the exception in the
-    // try_frame_to_bytes docs and the iff property test can go.
-    for (wire, frame) in [
-        (
-            &b"+a\rb\r\n"[..],
-            Frame::SimpleString(Bytes::from_static(b"a\rb")),
-        ),
-        (
-            b"-ERR a\nb\r\n",
-            Frame::Error(Bytes::from_static(b"ERR a\nb")),
-        ),
+fn parser_rejects_a_bare_cr_or_lf_in_line_payloads() {
+    // #99. The specs forbid both in simple strings and errors, and hiredis
+    // rejects them. Until 0.4 the parser read them back as payload.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"+a\nb\r\n"[..],
+        &b"+a\r\r\n"[..],
+        &b"+\n\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"-ERR a\rb\r\n"[..],
+        &b"*2\r\n+ok\r\n+a\rb\r\n"[..],
+        // No terminator yet, but a bare LF can never become valid.
+        &b"+a\nb"[..],
+        &b"+a\rb"[..],
     ] {
-        let (parsed, rest) = resp2::parse_frame(Bytes::copy_from_slice(wire)).unwrap();
-        assert_eq!(parsed, frame);
-        assert!(rest.is_empty());
+        assert_eq!(
+            resp2::parse_frame(Bytes::copy_from_slice(wire)),
+            Err(ParseError::InvalidFormat),
+            "{:?}",
+            Bytes::copy_from_slice(wire)
+        );
     }
+    // A CR as the last buffered byte may be the start of the terminator.
+    assert_eq!(
+        resp2::parse_frame(Bytes::from_static(b"+abc\r")),
+        Err(ParseError::Incomplete)
+    );
+    // Other line types are unaffected: a bulk string carries any bytes.
+    let (frame, _) = resp2::parse_frame(Bytes::from_static(b"$3\r\na\rb\r\n")).unwrap();
+    assert_eq!(frame, Frame::BulkString(Some(Bytes::from_static(b"a\rb"))));
 }
 
 #[test]
@@ -649,4 +661,92 @@ fn parser_reports_non_canonical_numbers_and_discards_the_buffer() {
     parser.feed(Bytes::from_static(b"*01\r\n:1\r\n+next\r\n"));
     assert_eq!(parser.next_frame(), Err(ParseError::BadLength));
     assert_eq!(parser.next_frame(), Ok(None));
+}
+
+/// Feed `wire` to a fresh Parser split at `cut`, and return the first
+/// non-`Ok(None)` result, or `Ok(None)` if both halves leave it incomplete.
+fn feed_split_resp2(wire: &[u8], cut: usize) -> Result<Option<Frame>, ParseError> {
+    let mut parser = resp2::Parser::new();
+    parser.feed(Bytes::copy_from_slice(&wire[..cut]));
+    match parser.next_frame() {
+        Ok(None) => {}
+        other => return other,
+    }
+    parser.feed(Bytes::copy_from_slice(&wire[cut..]));
+    parser.next_frame()
+}
+
+#[test]
+fn bare_cr_or_lf_is_rejected_at_every_split() {
+    // #99: a chunked feed must reach the same verdict as the whole buffer.
+    for wire in [
+        &b"+a\rb\r\n"[..],
+        &b"-ERR a\nb\r\n"[..],
+        &b"+ab\r\rx\r\n"[..],
+    ] {
+        for cut in 0..=wire.len() {
+            assert_eq!(
+                feed_split_resp2(wire, cut),
+                Err(ParseError::InvalidFormat),
+                "{:?} cut at {cut}",
+                Bytes::copy_from_slice(wire)
+            );
+        }
+    }
+}
+
+#[test]
+fn line_at_the_ceiling_parses_at_every_split_near_its_end() {
+    // A line of exactly MAX_LINE_LENGTH bytes is accepted whole, so it must be
+    // accepted when split anywhere, including between its CR and LF, where the
+    // trailing CR used to be counted toward the limit.
+    let mut wire = vec![b'+'];
+    wire.extend(core::iter::repeat_n(b'a', resp2::MAX_LINE_LENGTH));
+    wire.extend_from_slice(b"\r\n");
+    for cut in wire.len() - 4..=wire.len() {
+        assert!(
+            matches!(
+                feed_split_resp2(&wire, cut),
+                Ok(Some(Frame::SimpleString(_)))
+            ),
+            "cut at {cut} of {}",
+            wire.len()
+        );
+    }
+}
+
+#[test]
+fn bare_byte_past_the_ceiling_is_line_too_long_at_every_split() {
+    // Past the ceiling a chunked feed reports LineTooLong before it sees the
+    // bare byte, so the whole buffer must say the same.
+    for bad in *b"\n\r" {
+        let mut wire = vec![b'+'];
+        wire.extend(core::iter::repeat_n(b'a', resp2::MAX_LINE_LENGTH + 1));
+        wire.push(bad);
+        wire.extend_from_slice(b"x\r\n");
+        assert_eq!(
+            resp2::parse_frame(Bytes::from(wire.clone())),
+            Err(ParseError::LineTooLong)
+        );
+        for cut in wire.len() - 6..=wire.len() {
+            assert_eq!(
+                feed_split_resp2(&wire, cut),
+                Err(ParseError::LineTooLong),
+                "cut at {cut}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_serializer_refuses_a_line_over_the_ceiling() {
+    // #82 for RESP2: the parser rejects it, so emitting it would not read back.
+    let over = Frame::SimpleString(Bytes::from(vec![b'a'; resp2::MAX_LINE_LENGTH + 1]));
+    assert_eq!(
+        resp2::try_frame_to_bytes(&over),
+        Err(resp_rs::SerializeError::LineTooLong)
+    );
+    let at = Frame::Error(Bytes::from(vec![b'e'; resp2::MAX_LINE_LENGTH]));
+    let bytes = resp2::try_frame_to_bytes(&at).unwrap();
+    assert_eq!(resp2::parse_frame(bytes).unwrap().0, at);
 }

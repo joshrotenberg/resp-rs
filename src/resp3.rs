@@ -13,13 +13,15 @@
 //! # Protocol permissiveness
 //!
 //! - **Simple strings and errors** are treated as raw bytes, not validated UTF-8.
-//!   The parser ends the line at the first CRLF pair, so a bare `\r` or `\n`
-//!   is read back as payload. The specs forbid both there, and
-//!   [`try_frame_to_bytes`] refuses to emit them (#99).
-//! - **Double parsing** accepts case-insensitive and non-canonical float spellings
-//!   (e.g., `INF`, `Infinity`, `NAN`) via Rust's `f64::parse`, then normalizes
+//!   Any byte other than `\r` and `\n` is accepted; the specs forbid both
+//!   there, and the parser and [`try_frame_to_bytes`] refuse them (#99).
+//! - **Double parsing** accepts `inf`, `-inf`, `nan` and `-nan` in any case,
+//!   which the spec tells clients to tolerate from older Redis, and normalizes
 //!   them to canonical [`Frame::SpecialFloat`] values (`inf`, `-inf`, `nan`).
-//!   This means roundtrip is semantic (value-preserving) but not lexical
+//!   Finite values go through Rust's `f64::parse`, so forms such as `.5`, `1.`
+//!   and `+1.5` are accepted although the RESP3 grammar excludes them. Other
+//!   non-finite text (`infinity`, `+inf`, an overflowing `1e309`) is rejected
+//!   (#103). Roundtrip is semantic (value-preserving) but not lexical
 //!   (byte-preserving) for non-canonical inputs.
 //! - **Push frames** are accepted in any position, although the spec says they
 //!   only appear at the top level. A nested push is returned as an element of
@@ -609,28 +611,50 @@ fn parse_bulk_string(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, us
     }
 }
 
+/// The canonical [`Frame::SpecialFloat`] spelling for a double's special
+/// value, or `None` if the text is not one.
+///
+/// `inf`, `-inf` and `nan` are the RESP3 spellings. `-nan` and case variants
+/// such as `NaN` and `-INF` are accepted too, because the spec tells clients to
+/// tolerate them from Redis before 7.2. `infinity`, `+inf` and `+nan` are not:
+/// Redis has never sent them (#103).
+#[inline]
+pub(crate) fn special_float(text: &[u8]) -> Option<&'static [u8]> {
+    if text.eq_ignore_ascii_case(b"inf") {
+        Some(b"inf")
+    } else if text.eq_ignore_ascii_case(b"-inf") {
+        Some(b"-inf")
+    } else if text.eq_ignore_ascii_case(b"nan") || text.eq_ignore_ascii_case(b"-nan") {
+        Some(b"nan")
+    } else {
+        None
+    }
+}
+
 /// Parse a double frame (`,`).
+///
+/// A special value from [`special_float`] becomes a [`Frame::SpecialFloat`].
+/// Anything else must parse to a finite `f64`: a literal that overflows to
+/// infinity, such as `1e309`, is rejected rather than turned into `inf`, as
+/// hiredis does (#103).
 #[inline(never)]
 fn parse_double_frame(input: &Bytes, buf: &[u8], pos: usize) -> Result<(Frame, usize), ParseError> {
     let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
     let line_bytes = &buf[pos + 1..line_end];
-    if line_bytes == b"inf" || line_bytes == b"-inf" || line_bytes == b"nan" {
-        return Ok((
-            Frame::SpecialFloat(input.slice(pos + 1..line_end)),
-            after_crlf,
-        ));
+    if let Some(canonical) = special_float(line_bytes) {
+        let frame = if line_bytes == canonical {
+            Frame::SpecialFloat(input.slice(pos + 1..line_end))
+        } else {
+            Frame::SpecialFloat(Bytes::from_static(canonical))
+        };
+        return Ok((frame, after_crlf));
     }
     let s = core::str::from_utf8(line_bytes).map_err(|_| ParseError::Utf8Error)?;
     let v = s.parse::<f64>().map_err(|_| ParseError::InvalidFormat)?;
-    if v.is_infinite() || v.is_nan() {
-        let canonical = if v.is_nan() {
-            "nan"
-        } else if v.is_sign_negative() {
-            "-inf"
-        } else {
-            "inf"
-        };
-        return Ok((Frame::SpecialFloat(Bytes::from(canonical)), after_crlf));
+    // `str::parse` also accepts `infinity`, `+inf`, `+nan` and overflowing
+    // literals; everything non-finite that reaches here is one of those.
+    if !v.is_finite() {
+        return Err(ParseError::InvalidFormat);
     }
     Ok((Frame::Double(v), after_crlf))
 }
@@ -766,18 +790,19 @@ fn check_bare_crlf(buf: &[u8], pos: usize) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Check a big number payload against the grammar: an optional sign followed by
+/// Check a big number payload against the grammar: an optional `-` followed by
 /// one or more decimal digits.
+///
+/// A `+` sign was accepted until #104; hiredis rejects it, and it is consistent
+/// with integers (#102). Leading zeros and `-0` are still accepted: the payload
+/// is passed through as bytes rather than interpreted, and hiredis accepts them.
 ///
 /// Without this the arm hands back whatever the line held, and `frame_to_bytes`
 /// re-emits it verbatim, so the crate would both accept and reproduce
 /// non-conforming wire bytes.
 #[inline]
 fn check_big_number(payload: &[u8]) -> Result<(), ParseError> {
-    let digits = match payload.first() {
-        Some(b'+') | Some(b'-') => &payload[1..],
-        _ => payload,
-    };
+    let digits = payload.strip_prefix(b"-").unwrap_or(payload);
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(ParseError::InvalidFormat);
     }
@@ -919,14 +944,14 @@ pub(crate) fn parse_frame_inner(
     match tag {
         // Line-based types (small, stay inline)
         b'+' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let (line_end, after_crlf) = find_simple_line(buf, pos + 1)?;
             Ok((
                 Frame::SimpleString(input.slice(pos + 1..line_end)),
                 after_crlf,
             ))
         }
         b'-' => {
-            let (line_end, after_crlf) = find_crlf(buf, pos + 1)?;
+            let (line_end, after_crlf) = find_simple_line(buf, pos + 1)?;
             Ok((Frame::Error(input.slice(pos + 1..line_end)), after_crlf))
         }
         b':' => {
@@ -1223,11 +1248,61 @@ fn find_crlf(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
         }
         i += 1;
     }
-    if len - from > MAX_LINE_LENGTH {
+    // A trailing `\r` may be the first half of the terminator, so it is not
+    // counted: a line of exactly MAX_LINE_LENGTH bytes split between its `\r`
+    // and `\n` would otherwise fail in a chunked feed but parse whole.
+    let pending = if len > from && buf[len - 1] == b'\r' {
+        len - 1 - from
+    } else {
+        len - from
+    };
+    if pending > MAX_LINE_LENGTH {
         // Already past the ceiling with no terminator, so no CRLF arriving
         // later could bring it back into range. Reporting that rather than
         // `Incomplete` is what lets `Parser` drop the buffer instead of growing
         // it for as long as the peer keeps sending.
+        return Err(ParseError::LineTooLong);
+    }
+    Err(ParseError::Incomplete)
+}
+
+/// [`find_crlf`] for simple strings and errors, whose payload may not contain
+/// a CR or LF at all (#99).
+///
+/// One pass: a `\r\n` pair ends the line, and any other `\r` or `\n` is
+/// `InvalidFormat`, except a `\r` as the last buffered byte, whose `\n` may
+/// still arrive. The specs forbid both bytes here and hiredis rejects them.
+///
+/// Every verdict depends only on the bytes before the one that decides it, so
+/// a frame split at any byte gets the same result as the whole buffer. That is
+/// why a bare byte past the line ceiling is `LineTooLong`: a chunked feed that
+/// stopped just before it would already have reported that.
+#[inline]
+fn find_simple_line(buf: &[u8], from: usize) -> Result<(usize, usize), ParseError> {
+    let len = buf.len();
+    let mut i = from;
+    while i < len {
+        match buf[i] {
+            b'\r' if i + 1 == len => break,
+            b'\r' if buf[i + 1] == b'\n' => {
+                if i - from > MAX_LINE_LENGTH {
+                    return Err(ParseError::LineTooLong);
+                }
+                return Ok((i, i + 2));
+            }
+            b'\r' | b'\n' => {
+                return Err(if i - from > MAX_LINE_LENGTH {
+                    ParseError::LineTooLong
+                } else {
+                    ParseError::InvalidFormat
+                });
+            }
+            _ => i += 1,
+        }
+    }
+    // `i` stops short of `len` only at a trailing `\r`, which is not counted,
+    // as in `find_crlf`.
+    if i - from > MAX_LINE_LENGTH {
         return Err(ParseError::LineTooLong);
     }
     Err(ParseError::Incomplete)
@@ -1371,17 +1446,13 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 /// the rest), the reader is [`parse_streaming_sequence`] instead, since
 /// `parse_frame` returns only their header.
 ///
-/// One deliberate exception: a bare `\r` or `\n` in a simple string or error
-/// payload is refused although this crate's parser reads it back, because the
-/// specs forbid it there and peers such as hiredis reject it (#99).
-///
 /// The rules mirror the parser's acceptance grammar rather than being a
 /// separate list, so tightening a parse arm cannot silently open a gap here.
 /// What that catches, beyond a CRLF in a line payload:
 ///
 /// | Frame | Unchecked wire | Comes back as |
 /// | --- | --- | --- |
-/// | `SimpleString(b"a\nb")` | `+a\nb\r\n` | parses here, rejected by hiredis |
+/// | `SimpleString(b"a\nb")` | `+a\nb\r\n` | rejected (#99) |
 /// | `BigNumber(b"abc")` | `(abc\r\n` | rejected |
 /// | `SpecialFloat(b"1.5")` | `,1.5\r\n` | `Double(1.5)` |
 /// | `Double(f64::NAN)` | `,NaN\r\n` | `SpecialFloat(b"nan")` |
@@ -1394,10 +1465,12 @@ pub fn frame_to_bytes(frame: &Frame) -> Bytes {
 ///
 /// # Scope
 ///
-/// Grammar validity only. The parse-side resource limits ([`MAX_DEPTH`],
-/// [`MAX_LINE_LENGTH`], and the collection and bulk size caps) also stop a
-/// frame from parsing back, but they bound what a peer may send rather than
-/// what a `Frame` may represent, so they are deliberately not checked here.
+/// Grammar validity, plus the two size ceilings that apply to a single payload:
+/// a line over [`MAX_LINE_LENGTH`] is `LineTooLong` and a length-prefixed body
+/// over the bulk cap is `PayloadTooLong` (#82). The other parse-side limits
+/// ([`MAX_DEPTH`] and the collection size cap) also stop a frame from parsing
+/// back, but they bound the shape of what a peer may send rather than what one
+/// `Frame` value holds, so they are deliberately not checked here.
 ///
 /// # Examples
 ///
@@ -1419,10 +1492,8 @@ pub fn try_frame_to_bytes(frame: &Frame) -> Result<Bytes, SerializeError> {
 
 /// Reject a line payload containing a CR or LF.
 ///
-/// A CRLF pair would terminate the frame early. A bare `\r` or `\n` reads
-/// back through [`find_crlf`], which scans for the pair, but the specs forbid
-/// both in these lines and hiredis rejects them, so emitting one breaks other
-/// peers (#99).
+/// A CRLF pair would terminate the frame early, and the parser rejects a bare
+/// `\r` or `\n` in these lines, as the specs and hiredis do (#99).
 #[inline]
 fn check_line_payload(payload: &[u8]) -> Result<(), SerializeError> {
     if payload.iter().any(|&b| b == b'\r' || b == b'\n') {
@@ -1520,12 +1591,13 @@ fn try_serialize_frame(frame: &Frame, buf: &mut BytesMut) -> Result<(), Serializ
         }
         Frame::BigNumber(n) => {
             // parse_frame_inner checks the same grammar via check_big_number.
-            let digits = match n.first() {
-                Some(b'+') | Some(b'-') => &n[1..],
-                _ => &n[..],
-            };
+            let digits = n.strip_prefix(b"-").unwrap_or(n);
             if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
                 return Err(SerializeError::InvalidBigNumber);
+            }
+            // A line, so bounded by the same ceiling as a simple string.
+            if n.len() > MAX_LINE_LENGTH {
+                return Err(SerializeError::LineTooLong);
             }
             serialize_frame(frame, buf);
         }

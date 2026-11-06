@@ -236,6 +236,19 @@ to set, map, attribute and push counts. `$-1` and `*-1` are unchanged. The
 serializer has always emitted the canonical form, so frames produced by this
 crate are unaffected.
 
+Three more input forms that Redis never sends and hiredis rejects now fail with
+`ParseError::InvalidFormat`:
+
+| Input | 0.3 | 0.4 |
+| --- | --- | --- |
+| `(+123\r\n` | `BigNumber("+123")` | rejected; `try_frame_to_bytes` refuses it with `InvalidBigNumber` |
+| `,infinity\r\n`, `,+inf\r\n`, `,+nan\r\n` | `SpecialFloat` | rejected |
+| `,1e309\r\n` (overflows) | `SpecialFloat("inf")` | rejected |
+| `+a\rb\r\n`, `-ERR a\nb\r\n` | parsed with the bare CR or LF | rejected |
+
+`inf`, `-inf`, `nan` and `-nan` in any case are still accepted and normalized
+to `SpecialFloat`. Leading zeros and `-0` on big numbers are still accepted.
+
 ### 0.3.1 to 0.3.2
 
 `try_frame_to_bytes` in both protocols, and so the `Codec` encoders, now refuse
@@ -243,7 +256,7 @@ a bare `\r` or `\n` in a simple string or error payload, returning
 `SerializeError::LineContainsCrlf` as for a CRLF pair. The specs forbid both
 there and hiredis rejects them. A server that reflects user input into an error
 reply should replace them first; Redis maps each to a space. The parser still
-accepts them on input.
+accepts them on input in 0.3.2; 0.4 rejects them there too (see above).
 
 `resp3::parse_streaming_sequence` assembles a streamed value nested directly in
 a streamed aggregate, where it used to return the header and misreport the
