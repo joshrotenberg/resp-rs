@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-06
+
+### Fixed
+
+- Reject leading zeros, -0 and an explicit plus sign in integers, lengths and counts ([#113](https://github.com/joshrotenberg/resp-rs/pull/113)) [**breaking**]
+- Reject plus-signed big numbers, out-of-grammar doubles, and bare CR or LF in lines ([#115](https://github.com/joshrotenberg/resp-rs/pull/115)) [**breaking**]
+
+
+
 ## [0.3.2] - 2026-11-05
 
 ### Documentation
